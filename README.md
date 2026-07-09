@@ -112,9 +112,9 @@ Connection: close
 
 ### Phase 3: 冗余检测 + 输出
 
-**蜜罐检测**：安全厂商可能部署假节点来钓鱼。识别方法是——用一个随机垃圾域名
+**冗余验证**：安全厂商可能部署假节点来误导。识别方法是——用一个随机垃圾域名
 （如 `x7y8z9w1.org`）再次握手。正常的 REALITY 节点只有少数大厂证书，遇到
-不认识的 SNI 会中断连接。而蜜罐对任何 SNI 都回 `server: cloudflare`。
+不认识的 SNI 会中断连接。而异常节点对任何 SNI 都回 `server: cloudflare`。
 
 **GeoIP 富化**：如果安装了 MaxMind GeoLite2 免费数据库，工具会自动给每个发现的
 节点标记国家和城市。数据库放 `/usr/share/GeoIP/GeoLite2-City.mmdb`。
@@ -135,7 +135,7 @@ Connection: close
 | `--concurrency` | 验证并发数。默认 500，VPS 配置好可以开 2000。受 ulimit 保护 |
 | `--timeout` | 单次握手超时秒数。默认 3.0。网络差可调大到 5.0 |
 | `--output` | 输出文件路径。默认 `vuln_reality_cf_report.json` |
-| `--no-redundancy` | 关闭蜜罐检测。不推荐，除非你确定数据源干净 |
+| `--no-redundancy` | 关闭冗余验证。不推荐，除非你确定数据源干净 |
 
 ## 运行示例
 
