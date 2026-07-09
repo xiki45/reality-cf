@@ -145,7 +145,9 @@ async def main():
     parser.add_argument("--sni", help="目标大厂 SNI (如 images.apple.com)")
     parser.add_argument("--sni-list", help="SNI 列表文件，一行一个")
     parser.add_argument("--ledger", help="TLS 账本目录 (含 port-*-tls.json.gz)")
-    parser.add_argument("--auto-ledger", action="store_true", help="自动下载最新 TLS 账本")
+    parser.add_argument("--auto-ledger", action="store_true", default=True,
+                        help="自动下载最新 TLS 账本 (默认开启)")
+    parser.add_argument("--no-ledger", action="store_true", help="跳过 TLS 账本，仅用 CT 日志")
     parser.add_argument("--ledger-cache", default="./scans", help="TLS 账本缓存目录 (默认 ./scans)")
     parser.add_argument("--ports", default="443,8443,2053,2083,2096,2443",
                         help="伴随嗅探端口 (默认 443,8443,2053,2083,2096,2443)")
@@ -184,10 +186,10 @@ async def main():
 
     # Phase 1B: TLS 账本
     ledger_dir = args.ledger
-    if args.auto_ledger:
+    if args.auto_ledger and not args.no_ledger:
         from ledger_dl import download_ledger
         ledger_dir = await download_ledger(args.ledger_cache, ports)
-    if ledger_dir:
+    if ledger_dir and not args.no_ledger:
         for sni in snis:
             logger.info(f"[Phase 1B] TLS 账本: {sni}")
             targets = await fetch_tls_ledger(ledger_dir, sni)
