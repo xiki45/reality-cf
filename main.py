@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-REALITY-CF 漏洞精准抓取工具
+REALITY-CF 节点发现工具
 基于 CT 日志 + TLS 账本，双重握手验证，精准筛选可薅 CF 羊毛的 REALITY 节点。
 
 用法:
-  python3 main.py --sni images.apple.com --cf-domain xyz.899920.xyz
-  python3 main.py --sni swdist.apple.com --cf-domain xyz.899920.xyz --ledger scans/
-  python3 main.py --sni-list snis.txt --cf-domain xyz.899920.xyz
+  python3 main.py --sni images.apple.com
+  python3 main.py --sni swdist.apple.com --ledger scans/
+  python3 main.py --sni-list snis.txt
 """
 
 import sys, os, signal, argparse, resource, asyncio, logging
@@ -26,6 +26,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("reality-cf")
 
 DEFAULT_PORTS = [443, 8443, 2053, 2083, 2096, 2443]
+CF_PROBE_DOMAIN = "speed.cloudflare.com"
 
 
 async def interactive_mode(args):
@@ -45,7 +46,7 @@ async def interactive_mode(args):
         C = G = Y = R = ""
 
     print(f"\n{C}╔═══════════════════════════════════╗{R}")
-    print(f"{C}║   REALITY-CF 漏洞精准抓取 v1.0  ║{R}")
+    print(f"{C}║   REALITY-CF 节点发现 v1.0  ║{R}")
     print(f"{C}╚═══════════════════════════════════╝{R}\n")
 
     # Step 1: SNI
@@ -67,13 +68,7 @@ async def interactive_mode(args):
         print(f"{Y}未输入 SNI，退出{R}")
         return
 
-    # Step 2: CF domain
-    cf_domain = args.cf_domain
-    if not cf_domain:
-        cf_domain = input(f"\n{Y}📌 你的 CF 域名 (开小黄云):{R} ").strip()
-    if not cf_domain:
-        print(f"{Y}未输入 CF 域名，退出{R}")
-        return
+    # Step 2: CF 域名已内置 speed.cloudflare.com
 
     # Step 3: TLS ledger
     ledger = args.ledger
@@ -99,7 +94,7 @@ async def interactive_mode(args):
     # ── 运行 ──
     print(f"\n{G}▶ 开始抓取...{R}")
     print(f"  SNI: {G}{', '.join(snis)}{R}")
-    print(f"  CF:  {G}{cf_domain}{R}")
+    print(f"  CF:  {G}{CF_PROBE_DOMAIN}{R}")
     print(f"  并发: {concurrency}  端口: {ports_str}\n")
 
     from fetcher  import fetch_ct_logs, fetch_tls_ledger
@@ -135,9 +130,9 @@ async def interactive_mode(args):
 
     print(f"  [Phase 2] 双重 TLS 验证 (并发 {concurrency})")
     async for result in verify_batch(
-        target_list, snis, cf_domain,
+        target_list, snis, CF_PROBE_DOMAIN,
         concurrency=concurrency, timeout=args.timeout,
-        honeypot_check=not args.no_honeypot,
+        redundancy_check=not args.no_redundancy,
     ):
         reporter.on_result(result)
 
@@ -146,17 +141,16 @@ async def interactive_mode(args):
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="REALITY-CF 漏洞精准抓取")
+    parser = argparse.ArgumentParser(description="REALITY-CF 节点发现")
     parser.add_argument("--sni", help="目标大厂 SNI (如 images.apple.com)")
     parser.add_argument("--sni-list", help="SNI 列表文件，一行一个")
-    parser.add_argument("--cf-domain", help="用户私有 CF 域名 (开小黄云)，交互模式可选")
     parser.add_argument("--ledger", help="TLS 账本目录 (含 port-*-tls.json.gz)")
     parser.add_argument("--ports", default="443,8443,2053,2083,2096,2443",
                         help="伴随嗅探端口 (默认 443,8443,2053,2083,2096,2443)")
     parser.add_argument("--concurrency", type=int, default=500, help="验证并发数 (默认 500)")
     parser.add_argument("--timeout", type=float, default=3.0, help="单次握手超时 (默认 3s)")
     parser.add_argument("--output", default="vuln_reality_cf_report.json", help="输出文件")
-    parser.add_argument("--no-honeypot", action="store_true", help="关闭蜜罐过滤")
+    parser.add_argument("--no-redundancy", action="store_true", help="关闭冗余检测")
     args = parser.parse_args()
 
     # ── SNI 列表 ──
@@ -207,10 +201,10 @@ async def main():
 
     logger.info(f"[Phase 2] 双重 TLS 交叉验证 (并发 {args.concurrency})")
     async for result in verify_batch(
-        target_list, snis, args.cf_domain,
+        target_list, snis, CF_PROBE_DOMAIN,
         concurrency=args.concurrency,
         timeout=args.timeout,
-        honeypot_check=not args.no_honeypot,
+        redundancy_check=not args.no_redundancy,
     ):
         reporter.on_result(result)
 
