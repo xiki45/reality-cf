@@ -44,7 +44,7 @@ echo
 echo -e "  快速开始:"
 echo -e "    ${CYAN}reality-cf --sni images.apple.com --cf-domain your.domain.com${NC}"
 echo
-echo -e "  交互模式:"
+echo -e "  菜单模式:"
 echo -e "    ${CYAN}reality-cf${NC}"
 echo
 echo -e "  更新:"
