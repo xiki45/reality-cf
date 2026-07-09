@@ -6,7 +6,7 @@
 # Linux / macOS 一键安装
 curl -fsSL https://raw.githubusercontent.com/e13815332/reality-cf/main/install.sh | bash
 
-# 交互模式
+# 菜单模式 (无参数启动)
 reality-cf
 
 # 命令行模式
