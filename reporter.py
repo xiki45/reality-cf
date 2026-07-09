@@ -53,7 +53,7 @@ class Reporter:
     def finish(self):
         self._fp.write("\n]\n")
         self._fp.close()
-        logger.info(f"共发现 {self.count} 个漏洞节点 → {self.output_path}")
+        logger.info(f"共发现 {self.count} 个配置特性节点 → {self.output_path}")
 
 
 def _lookup_geo(ip: str) -> dict:
