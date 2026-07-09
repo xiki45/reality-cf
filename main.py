@@ -28,11 +28,128 @@ logger = logging.getLogger("reality-cf")
 DEFAULT_PORTS = [443, 8443, 2053, 2083, 2096, 2443]
 
 
+async def interactive_mode(args):
+    """交互式菜单模式"""
+
+    PRESETS = {
+        "1": ("images.apple.com", "Apple CDN"),
+        "2": ("swdist.apple.com", "Apple Software"),
+        "3": ("download.microsoft.com", "Microsoft CDN"),
+    }
+
+    try:
+        from colorama import init, Fore, Style
+        init(autoreset=True)
+        C = Fore.CYAN; G = Fore.GREEN; Y = Fore.YELLOW; R = Style.RESET_ALL
+    except ImportError:
+        C = G = Y = R = ""
+
+    print(f"\n{C}╔═══════════════════════════════════╗{R}")
+    print(f"{C}║   REALITY-CF 漏洞精准抓取 v1.0  ║{R}")
+    print(f"{C}╚═══════════════════════════════════╝{R}\n")
+
+    # Step 1: SNI
+    print(f"{Y}📌 选择目标 SNI:{R}")
+    for k, (sni, desc) in PRESETS.items():
+        print(f"  {G}{k}{R}. {sni} ({desc})")
+    print(f"  {G}c{R}. 自定义输入")
+    choice = input(f"\n  选择 [1]: ").strip() or "1"
+
+    snis = []
+    if choice in PRESETS:
+        snis.append(PRESETS[choice][0])
+    else:
+        custom = input("  输入 SNI: ").strip()
+        if custom:
+            snis.append(custom)
+
+    if not snis:
+        print(f"{Y}未输入 SNI，退出{R}")
+        return
+
+    # Step 2: CF domain
+    cf_domain = args.cf_domain
+    if not cf_domain:
+        cf_domain = input(f"\n{Y}📌 你的 CF 域名 (开小黄云):{R} ").strip()
+    if not cf_domain:
+        print(f"{Y}未输入 CF 域名，退出{R}")
+        return
+
+    # Step 3: TLS ledger
+    ledger = args.ledger
+    if not ledger:
+        use_ledger = input(f"\n{Y}📌 使用 TLS 账本? (y/N):{R} ").strip().lower()
+        if use_ledger == "y":
+            ledger = input("  TLS 账本目录: ").strip()
+
+    # Step 4: Concurrency
+    concurrency = args.concurrency
+    custom_cc = input(f"\n{Y}📌 并发数 [500]:{R} ").strip()
+    if custom_cc:
+        concurrency = int(custom_cc)
+
+    # Step 5: Ports
+    ports_str = args.ports
+    custom_ports = input(f"{Y}📌 端口 [{ports_str}]:{R} ").strip()
+    if custom_ports:
+        ports_str = custom_ports
+
+    ports = [int(p) for p in ports_str.split(",")]
+
+    # ── 运行 ──
+    print(f"\n{G}▶ 开始抓取...{R}")
+    print(f"  SNI: {G}{', '.join(snis)}{R}")
+    print(f"  CF:  {G}{cf_domain}{R}")
+    print(f"  并发: {concurrency}  端口: {ports_str}\n")
+
+    from fetcher  import fetch_ct_logs, fetch_tls_ledger
+    from verifier import verify_batch
+    from reporter import Reporter
+
+    all_targets: set[tuple[str, int]] = set()
+
+    for sni in snis:
+        print(f"  [Phase 1A] CT 日志: {sni}")
+        targets = await fetch_ct_logs(sni, ports, args.timeout)
+        all_targets.update(targets)
+        print(f"    → {C}{len(targets)}{R} 候选")
+
+    if ledger:
+        for sni in snis:
+            print(f"  [Phase 1B] TLS 账本: {sni}")
+            targets = await fetch_tls_ledger(ledger, sni)
+            all_targets.update(targets)
+            print(f"    → {C}{len(targets)}{R} 候选")
+
+    all_targets = all_targets & all_targets  # no-op type hint
+
+    if not all_targets:
+        print(f"{Y}  未获取到候选节点{R}")
+        return
+
+    target_list = list(all_targets)
+    print(f"\n  {G}总计 {len(target_list)} 个待验证{R}\n")
+
+    reporter = Reporter(args.output)
+    reporter.start()
+
+    print(f"  [Phase 2] 双重 TLS 验证 (并发 {concurrency})")
+    async for result in verify_batch(
+        target_list, snis, cf_domain,
+        concurrency=concurrency, timeout=args.timeout,
+        honeypot_check=not args.no_honeypot,
+    ):
+        reporter.on_result(result)
+
+    reporter.finish()
+    print(f"\n{G}✅ 完成 — 结果 → {args.output}{R}\n")
+
+
 async def main():
     parser = argparse.ArgumentParser(description="REALITY-CF 漏洞精准抓取")
     parser.add_argument("--sni", help="目标大厂 SNI (如 images.apple.com)")
     parser.add_argument("--sni-list", help="SNI 列表文件，一行一个")
-    parser.add_argument("--cf-domain", required=True, help="用户私有 CF 域名 (开小黄云)")
+    parser.add_argument("--cf-domain", help="用户私有 CF 域名 (开小黄云)，交互模式可选")
     parser.add_argument("--ledger", help="TLS 账本目录 (含 port-*-tls.json.gz)")
     parser.add_argument("--ports", default="443,8443,2053,2083,2096,2443",
                         help="伴随嗅探端口 (默认 443,8443,2053,2083,2096,2443)")
@@ -53,8 +170,9 @@ async def main():
                 if line and not line.startswith("#"):
                     snis.append(line)
     if not snis:
-        logger.error("请提供 --sni 或 --sni-list")
-        sys.exit(1)
+        # 交互模式
+        await interactive_mode(args)
+        return
 
     ports = [int(p) for p in args.ports.split(",")]
 
