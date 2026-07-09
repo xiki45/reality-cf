@@ -3,7 +3,7 @@ chcp 65001 >nul
 title REALITY-CF Windows 打包
 
 echo ============================================
-echo   REALITY-CF 漏洞精准抓取 — Windows 打包
+echo   REALITY-CF 节点发现 — Windows 打包
 echo ============================================
 echo.
 
