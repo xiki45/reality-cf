@@ -1,5 +1,20 @@
 # REALITY-CF 节点发现工具
 
+## 快速开始
+
+```bash
+# Linux / macOS 一键安装
+curl -fsSL https://raw.githubusercontent.com/e13815332/reality-cf/main/install.sh | bash
+
+# 交互模式
+reality-cf
+
+# 命令行模式
+reality-cf --sni images.apple.com
+
+# Windows: 下载项目 → 双击 build.bat → dist\reality-cf.exe
+```
+
 ## 这是什么
 
 REALITY 协议虽然加密了 SNI，但 Xray-core 的 REALITY 配置中有一个常见配置特性：
@@ -186,6 +201,27 @@ JSON:
 - Linux 自动 `ulimit -n 65535`
 - 不依赖 masscan、nmap
 - 不需要 API Key
+
+## 安装
+
+### Linux / macOS
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/e13815332/reality-cf/main/install.sh | bash
+```
+
+安装后全局可用 `reality-cf` 命令。
+
+### Windows
+
+1. 下载项目 ZIP 或 `git clone`
+2. 双击 `build.bat`
+3. 等待编译完成，输出 `dist\reality-cf.exe`
+4. 双击 exe 进入交互模式，或命令行运行
+
+```cmd
+dist\reality-cf.exe --sni images.apple.com
+```
 
 ## 推荐 SNI
 
