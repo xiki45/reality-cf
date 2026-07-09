@@ -29,8 +29,8 @@ DEFAULT_PORTS = [443, 8443, 2053, 2083, 2096, 2443]
 CF_PROBE_DOMAIN = "speed.cloudflare.com"
 
 
-async def interactive_mode(args):
-    """交互式菜单模式"""
+async def menu_mode(args):
+    """菜单式菜单模式"""
 
     PRESETS = {
         "1": ("images.apple.com", "Apple CDN"),
@@ -168,8 +168,8 @@ async def main():
                 if line and not line.startswith("#"):
                     snis.append(line)
     if not snis:
-        # 交互模式
-        await interactive_mode(args)
+        # 菜单模式
+        await menu_mode(args)
         return
 
     ports = [int(p) for p in args.ports.split(",")]
