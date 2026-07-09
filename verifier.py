@@ -1,5 +1,5 @@
 """
-Phase 2: 双重 TLS 交叉验证模块 + Phase 3 蜜罐过滤
+Phase 2: 双重 TLS 交叉验证模块 + Phase 3 冗余检测
 高并发 asyncio + Semaphore，任意一步失败即丢弃。
 """
 
@@ -12,11 +12,11 @@ logger = logging.getLogger("reality-cf.verifier")
 
 async def verify_single(
     ip: str, port: int, target_sni: str, my_cf_domain: str,
-    timeout: float = 3.0, honeypot_check: bool = True
+    timeout: float = 3.0, redundancy_check: bool = True
 ) -> dict | None:
     """
     对单个 IP:PORT 执行双重握手验证。
-    返回 dict 表示漏洞确认，None 表示丢弃。
+    返回 dict 表示配置特性确认，None 表示丢弃。
     """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -68,7 +68,7 @@ async def verify_single(
         return None
 
     # ══════════════════════════════════════
-    # Step 2: CF 反代漏洞判定
+    # Step 2: CF 反代配置特性判定
     # ══════════════════════════════════════
     try:
         reader, writer = await asyncio.wait_for(
@@ -101,10 +101,10 @@ async def verify_single(
         return None
 
     # ══════════════════════════════════════
-    # Phase 3: 蜜罐过滤
+    # Phase 3: 冗余检测
     # ══════════════════════════════════════
-    if honeypot_check and await _is_honeypot(ip, port, timeout, loop):
-        logger.debug(f"  蜜罐过滤: {ip}:{port}")
+    if redundancy_check and await _is_redundancy(ip, port, timeout, loop):
+        logger.debug(f"  冗余检测: {ip}:{port}")
         return None
 
     return {
@@ -112,11 +112,11 @@ async def verify_single(
         "port": port,
         "target_sni": target_sni,
         "common_name": str(common_name),
-        "status": "VULNERABLE",
+        "status": "AVAILABLE",
     }
 
 
-async def _is_honeypot(ip: str, port: int, timeout: float, loop) -> bool:
+async def _is_redundancy(ip: str, port: int, timeout: float, loop) -> bool:
     """随机混淆 SNI 验证: 若仍返回 CF 头 → 蜜罐"""
     random_sni = "".join(random.choices(string.ascii_lowercase, k=10)) + ".org"
 
@@ -151,7 +151,7 @@ async def _is_honeypot(ip: str, port: int, timeout: float, loop) -> bool:
 async def verify_batch(
     targets: list[tuple[str, int]], target_snis: list[str],
     my_cf_domain: str, concurrency: int = 500,
-    timeout: float = 3.0, honeypot_check: bool = True,
+    timeout: float = 3.0, redundancy_check: bool = True,
 ):
     """
     批量验证，流式 yield 结果。
@@ -175,7 +175,7 @@ async def verify_batch(
             async with sem:
                 result = await verify_single(
                     ip, port, sni, my_cf_domain,
-                    timeout=timeout, honeypot_check=honeypot_check,
+                    timeout=timeout, redundancy_check=redundancy_check,
                 )
                 if result:
                     yield result
