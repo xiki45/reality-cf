@@ -1,15 +1,15 @@
-# REALITY-CF 漏洞精准抓取工具
+# REALITY-CF 节点发现工具
 
 ## 这是什么
 
-REALITY 协议虽然加密了 SNI，但 Xray-core 的 REALITY 配置中有一个常见漏洞：
+REALITY 协议虽然加密了 SNI，但 Xray-core 的 REALITY 配置中有一个常见配置特性：
 `serverNames` 设为空数组 `[]`。这意味着服务端**没有限制允许的 SNI**，
 任何 TLS 握手只要证书对得上，它都接受。
 
-这就出现一个漏洞：你用苹果的证书做 REALITY，正常只应该苹果的 SNI 能通。
-但攻击者用**自己控制的 Cloudflare 域名**去握手，REALITY 服务端一样会透传给
+这就出现一个配置特性：你用苹果的证书做 REALITY，正常只应该苹果的 SNI 能通。
+但其他人用**自己控制的 Cloudflare 域名**去握手，REALITY 服务端一样会透传给
 目标服务器。因为目标服务器配了 CF CDN，它回了一个 `cf-ray` 头 ——
-等于这个节点被"薅羊毛"，别人也能当 CF 反代用。
+等于这个节点被"复用"，别人也能当 CF 反代用。
 
 这个工具就是自动化发现这些节点的。
 
@@ -19,7 +19,7 @@ REALITY 协议虽然加密了 SNI，但 Xray-core 的 REALITY 配置中有一个
 正常 REALITY 节点:
   客户端 → [SNI=apple.com] → REALITY服务端 → 苹果服务器
 
-漏洞 REALITY 节点:
+配置特性 REALITY 节点:
   客户端 → [SNI=你的CF域名] → REALITY服务端 → Cloudflare → 返回 cf-ray
                                                     ↑
                                           这里不该通的！serverNames 没限制
@@ -92,7 +92,7 @@ ctx.verify_mode = ssl.CERT_NONE  # 不验证证书链
 解析证书的 Common Name (CN)。如果 CN 确实包含目标大厂的域名，说明该端口
 100% 部署了以该大厂为伪装对象的 REALITY 服务。
 
-**Step 2 — CF 反代漏洞判定**
+**Step 2 — CF 反代配置特性判定**
 
 换一个 SNI——这次用你自己的 Cloudflare 域名（必须开了 CDN 小黄云）。
 重新建连（不能复用 Step 1 的连接），再次 TLS 握手，然后发一个极简 HTTP 请求：
@@ -108,9 +108,9 @@ Connection: close
 2. 流量被透传到了 Cloudflare（因为你域名开了 CDN）
 3. Cloudflare 正常回包并打了 `cf-ray` 标记
 
-→ 确认漏洞。
+→ 确认配置特性。
 
-### Phase 3: 蜜罐过滤 + 输出
+### Phase 3: 冗余检测 + 输出
 
 **蜜罐检测**：安全厂商可能部署假节点来钓鱼。识别方法是——用一个随机垃圾域名
 （如 `x7y8z9w1.org`）再次握手。正常的 REALITY 节点只有少数大厂证书，遇到
@@ -120,7 +120,7 @@ Connection: close
 节点标记国家和城市。数据库放 `/usr/share/GeoIP/GeoLite2-City.mmdb`。
 
 **输出**：
-- 终端实时彩色打印（绿色 = 发现漏洞节点）
+- 终端实时彩色打印（绿色 = 发现配置特性节点）
 - 流式写入 JSON 文件（不用等全部跑完，边发现边写）
 
 ## 参数说明
@@ -135,7 +135,7 @@ Connection: close
 | `--concurrency` | 验证并发数。默认 500，VPS 配置好可以开 2000。受 ulimit 保护 |
 | `--timeout` | 单次握手超时秒数。默认 3.0。网络差可调大到 5.0 |
 | `--output` | 输出文件路径。默认 `vuln_reality_cf_report.json` |
-| `--no-honeypot` | 关闭蜜罐检测。不推荐，除非你确定数据源干净 |
+| `--no-redundancy` | 关闭蜜罐检测。不推荐，除非你确定数据源干净 |
 
 ## 运行示例
 
@@ -173,7 +173,7 @@ JSON:
     "port": 8443,
     "target_sni": "images.apple.com",
     "common_name": "images.apple.com",
-    "status": "VULNERABLE",
+    "status": "AVAILABLE",
     "geo": {"country": "US", "city": "New York", "asn": ""},
     "timestamp": "2026-07-08T22:00:00"
   }
