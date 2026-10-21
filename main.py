@@ -1,228 +1,314 @@
 #!/usr/bin/env python3
 """
-REALITY-CF 节点发现工具
-基于 CT 日志 + TLS 账本，双重握手验证，精准筛选可薅 CF 羊毛的 REALITY 节点。
+REALITY-CF 节点发现
+
+发现「target 落在 Cloudflare 后面、且会把失败认证流量原样转发」的 REALITY 节点，
+即 Xray 官方文档所述「服务器实际沦为 CF 端口转发器、可被扫描滥用」的那一类。
 
 用法:
-  python3 main.py --sni images.apple.com
-  python3 main.py --sni swdist.apple.com --ledger scans/
-  python3 main.py --sni-list snis.txt
+  reality-cf --sni images.apple.com --cf-domain my.domain.com
+  reality-cf --sni images.apple.com --targets ips.txt --cf-domain my.domain.com
+  reality-cf --sni-list snis.txt --ledger ./scans --cf-domain my.domain.com
+  reality-cf                      # 无参数 → 交互菜单
+
+v2 修复要点：
+  - 新增 --cf-domain（v1 文档写了但 argparse 里没有，所有示例都 exit=2）
+  - 新增 --targets（公网数据源不可用时唯一直通路径）
+  - --ledger 不再被 --auto-ledger 覆盖（v1 会把它冲成 None）
+  - 数据源全部为空时给出可操作的指引，而不是 sys.exit(1)
+  - 输出统计（各阶段丢弃原因），0 命中时能定位到具体环节
 """
 
-import sys, os, signal, argparse, resource, asyncio, logging
-from pathlib import Path
+from __future__ import annotations
 
-# ── 文件描述符提升 ──
-try:
-    resource.setrlimit(resource.RLIMIT_NOFILE, (65535, 65535))
-except Exception:
-    pass
+import argparse
+import asyncio
+import logging
+import sys
 
-from fetcher   import fetch_ct_logs, fetch_tls_ledger
-from verifier  import verify_batch
-from reporter  import Reporter
+from fetcher import DEFAULT_PORTS, fetch_ct_logs, fetch_tls_ledger, parse_targets_file
+from reporter import Reporter, print_summary
+from verifier import get_stats, reset_stats, verify_batch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("reality-cf")
 
-DEFAULT_PORTS = [443, 8443, 2053, 2083, 2096, 2443]
 CF_PROBE_DOMAIN = "speed.cloudflare.com"
+PRESETS = [
+    ("images.apple.com", "Apple CDN"),
+    ("swdist.apple.com", "Apple Software"),
+    ("download.microsoft.com", "Microsoft CDN"),
+]
 
 
-async def menu_mode(args):
-    """菜单式菜单模式"""
+# ══════════════════════════════════════════════════════════════
+# 资产收集编排
+# ══════════════════════════════════════════════════════════════
 
-    PRESETS = {
-        "1": ("images.apple.com", "Apple CDN"),
-        "2": ("swdist.apple.com", "Apple Software"),
-        "3": ("download.microsoft.com", "Microsoft CDN"),
-    }
+async def collect_targets(args, snis: list[str], ports: list[int]) -> set[tuple[str, int]]:
+    targets: set[tuple[str, int]] = set()
 
-    try:
-        from colorama import init, Fore, Style
-        init(autoreset=True)
-        C = Fore.CYAN; G = Fore.GREEN; Y = Fore.YELLOW; R = Style.RESET_ALL
-    except ImportError:
-        C = G = Y = R = ""
+    # C: 手工清单（最先加载，保证即使外网全挂也能跑）
+    for path in args.targets or []:
+        try:
+            got = parse_targets_file(path, default_port=ports[0])
+            logger.info("[Phase 1C] 目标清单 %s → %d 个 IP:PORT", path, len(got))
+            targets.update(got)
+        except FileNotFoundError:
+            logger.error("目标清单不存在: %s", path)
+        except Exception as exc:
+            logger.error("目标清单解析失败 %s: %s", path, exc)
 
-    print(f"\n{C}╔═══════════════════════════════════╗{R}")
-    print(f"{C}║   REALITY-CF 节点发现 v1.0  ║{R}")
-    print(f"{C}╚═══════════════════════════════════╝{R}\n")
-
-    # Step 1: SNI
-    print(f"{Y}📌 选择目标 SNI:{R}")
-    for k, (sni, desc) in PRESETS.items():
-        print(f"  {G}{k}{R}. {sni} ({desc})")
-    print(f"  {G}c{R}. 自定义输入")
-    choice = input(f"\n  选择 [1]: ").strip() or "1"
-
-    snis = []
-    if choice in PRESETS:
-        snis.append(PRESETS[choice][0])
-    else:
-        custom = input("  输入 SNI: ").strip()
-        if custom:
-            snis.append(custom)
-
-    if not snis:
-        print(f"{Y}未输入 SNI，退出{R}")
-        return
-
-    # Step 2: CF 域名已内置 speed.cloudflare.com
-
-    # Step 3: TLS ledger
-    ledger = args.ledger
-    if not ledger:
-        use_ledger = input(f"\n{Y}📌 使用 TLS 账本? (y/N):{R} ").strip().lower()
-        if use_ledger == "y":
-            ledger = input("  TLS 账本目录: ").strip()
-
-    # Step 4: Concurrency
-    concurrency = args.concurrency
-    custom_cc = input(f"\n{Y}📌 并发数 [500]:{R} ").strip()
-    if custom_cc:
-        concurrency = int(custom_cc)
-
-    # Step 5: Ports
-    ports_str = args.ports
-    custom_ports = input(f"{Y}📌 端口 [{ports_str}]:{R} ").strip()
-    if custom_ports:
-        ports_str = custom_ports
-
-    ports = [int(p) for p in ports_str.split(",")]
-
-    # ── 运行 ──
-    print(f"\n{G}▶ 开始抓取...{R}")
-    print(f"  SNI: {G}{', '.join(snis)}{R}")
-    print(f"  CF:  {G}{CF_PROBE_DOMAIN}{R}")
-    print(f"  并发: {concurrency}  端口: {ports_str}\n")
-
-    from fetcher  import fetch_ct_logs, fetch_tls_ledger
-    from verifier import verify_batch
-    from reporter import Reporter
-
-    all_targets: set[tuple[str, int]] = set()
-
-    for sni in snis:
-        print(f"  [Phase 1A] CT 日志: {sni}")
-        targets = await fetch_ct_logs(sni, ports, args.timeout)
-        all_targets.update(targets)
-        print(f"    → {C}{len(targets)}{R} 候选")
-
-    if ledger:
+    # A: CT 日志
+    if not args.no_ct:
         for sni in snis:
-            print(f"  [Phase 1B] TLS 账本: {sni}")
-            targets = await fetch_tls_ledger(ledger, sni)
-            all_targets.update(targets)
-            print(f"    → {C}{len(targets)}{R} 候选")
+            logger.info("[Phase 1A] CT 日志: %s", sni)
+            got = await fetch_ct_logs(sni, ports, args.timeout, retries=args.ct_retries)
+            logger.info("  → %d 个候选", len(got))
+            targets.update(got)
 
-    all_targets = all_targets & all_targets  # no-op type hint
+    # B: TLS 账本
+    if not args.no_ledger:
+        ledger_dir = args.ledger
+        if not ledger_dir and args.auto_ledger:
+            from ledger_dl import download_ledger
 
-    if not all_targets:
-        print(f"{Y}  未获取到候选节点{R}")
-        return
+            ledger_dir = await download_ledger(args.ledger_cache, ports, limit=args.ledger_limit)
+        if ledger_dir:
+            for sni in snis:
+                logger.info("[Phase 1B] TLS 账本: %s", sni)
+                got = await fetch_tls_ledger(ledger_dir, sni, assume_port=args.assume_port)
+                logger.info("  → %d 个候选", len(got))
+                targets.update(got)
+        elif args.ledger:
+            logger.error("账本目录不可用: %s", args.ledger)
 
-    target_list = list(all_targets)
-    print(f"\n  {G}总计 {len(target_list)} 个待验证{R}\n")
+    return targets
 
-    reporter = Reporter(args.output)
+
+def _empty_hint() -> str:
+    return (
+        "没有拿到任何候选目标。三条路任选其一：\n"
+        "  1) 给 IP 清单（最可靠）：reality-cf --sni <大厂域名> --targets ips.txt --cf-domain <你的CF域名>\n"
+        "  2) 给账本目录：--ledger <目录>（目录内放 *.json.gz，每条含 ip/port/server_name）\n"
+        "  3) 修好外网数据源：crt.sh 或配置 SONAR_API_KEY 后加 --auto-ledger\n"
+        "  注：CT 日志只能枚举域名（不含 IP），单靠它扫不到第三方中转节点。"
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# 运行
+# ══════════════════════════════════════════════════════════════
+
+async def run(args) -> int:
+    snis = _load_snis(args)
+    ports = _parse_ports(args.ports)
+
+    logger.info("目标 SNI: %s | CF 域名: %s | 端口: %s",
+                ", ".join(snis), args.cf_domain, ",".join(map(str, ports)))
+
+    targets = await collect_targets(args, snis, ports)
+    if not targets:
+        print(_empty_hint(), file=sys.stderr)
+        return 2
+
+    logger.info("总计 %d 个待验证 IP:PORT（并发 %d，超时 %.1fs）",
+                len(targets), args.concurrency, args.timeout)
+
+    reset_stats()
+    reporter = Reporter(args.output, fmt=args.format)
     reporter.start()
 
-    print(f"  [Phase 2] 双重 TLS 验证 (并发 {concurrency})")
-    async for result in verify_batch(
-        target_list, snis, CF_PROBE_DOMAIN,
-        concurrency=concurrency, timeout=args.timeout,
-        redundancy_check=not args.no_redundancy,
-    ):
-        reporter.on_result(result)
+    try:
+        async for result in verify_batch(
+            sorted(targets), snis, args.cf_domain,
+            concurrency=args.concurrency,
+            timeout=args.timeout,
+            redundancy_check=not args.no_redundancy,
+        ):
+            reporter.on_result(result)
+    except KeyboardInterrupt:
+        reporter.abort()
+        logger.warning("已中断，已发现的结果已落盘 → %s", args.output)
+        print_summary(get_stats().dump())
+        return 130
 
     reporter.finish()
-    print(f"\n{G}✅ 完成 — 结果 → {args.output}{R}\n")
+    print_summary(get_stats().dump())
+    return 0 if reporter.count or get_stats().total else 1
 
 
-async def main():
-    parser = argparse.ArgumentParser(description="REALITY-CF 节点发现")
-    parser.add_argument("--sni", help="目标大厂 SNI (如 images.apple.com)")
-    parser.add_argument("--sni-list", help="SNI 列表文件，一行一个")
-    parser.add_argument("--ledger", help="TLS 账本目录 (含 port-*-tls.json.gz)")
-    parser.add_argument("--auto-ledger", action="store_true", default=True,
-                        help="自动下载最新 TLS 账本 (默认开启)")
-    parser.add_argument("--no-ledger", action="store_true", help="跳过 TLS 账本，仅用 CT 日志")
-    parser.add_argument("--ledger-cache", default="./scans", help="TLS 账本缓存目录 (默认 ./scans)")
-    parser.add_argument("--ports", default="443,8443,2053,2083,2096,2443",
-                        help="伴随嗅探端口 (默认 443,8443,2053,2083,2096,2443)")
-    parser.add_argument("--concurrency", type=int, default=500, help="验证并发数 (默认 500)")
-    parser.add_argument("--timeout", type=float, default=3.0, help="单次握手超时 (默认 3s)")
-    parser.add_argument("--output", default="vuln_reality_cf_report.json", help="输出文件")
-    parser.add_argument("--no-redundancy", action="store_true", help="关闭冗余检测")
-    args = parser.parse_args()
-
-    # ── SNI 列表 ──
-    snis = []
+def _load_snis(args) -> list[str]:
+    snis: list[str] = []
     if args.sni:
         snis.append(args.sni.strip())
-    if args.sni_list:
-        with open(args.sni_list) as f:
-            for line in f:
+    for path in args.sni_list or []:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
                 line = line.strip()
                 if line and not line.startswith("#"):
                     snis.append(line)
-    if not snis:
-        # 菜单模式
-        await menu_mode(args)
-        return
+    seen, out = set(), []
+    for s in snis:
+        if s.lower() not in seen:
+            seen.add(s.lower())
+            out.append(s)
+    return out
 
-    ports = [int(p) for p in args.ports.split(",")]
 
-    # ── 任务队列 ──
-    all_targets: set[tuple[str, int]] = set()
+def _parse_ports(raw: str) -> list[int]:
+    ports: list[int] = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            port = int(part)
+        except ValueError:
+            continue
+        if 0 < port < 65536 and port not in ports:
+            ports.append(port)
+    return ports or list(DEFAULT_PORTS)
 
-    # Phase 1A: CT 日志
-    for sni in snis:
-        logger.info(f"[Phase 1A] CT 日志: {sni}")
-        targets = await fetch_ct_logs(sni, ports, args.timeout)
-        all_targets.update(targets)
-        logger.info(f"  → 获取 {len(targets)} 候选")
 
-    # Phase 1B: TLS 账本
-    ledger_dir = args.ledger
-    if args.auto_ledger and not args.no_ledger:
-        from ledger_dl import download_ledger
-        ledger_dir = await download_ledger(args.ledger_cache, ports)
-    if ledger_dir and not args.no_ledger:
-        for sni in snis:
-            logger.info(f"[Phase 1B] TLS 账本: {sni}")
-            targets = await fetch_tls_ledger(ledger_dir, sni)
-            all_targets.update(targets)
-            logger.info(f"  → 获取 {len(targets)} 候选")
+# ══════════════════════════════════════════════════════════════
+# 交互菜单
+# ══════════════════════════════════════════════════════════════
 
-    if not all_targets:
-        logger.error("未获取到任何候选节点，请检查 SNI 或网络")
-        sys.exit(1)
+async def menu_mode(args) -> int:
+    print("\n╔══════════════════════════════════════════╗")
+    print("║   REALITY-CF 节点发现  v2.0              ║")
+    print("╚══════════════════════════════════════════╝\n")
 
-    target_list = list(all_targets)
-    logger.info(f"总计 {len(target_list)} 个待验证 IP:PORT")
+    print("📌 选择目标 SNI：")
+    for i, (sni, desc) in enumerate(PRESETS, 1):
+        print(f"  {i}. {sni} ({desc})")
+    print("  c. 自定义输入")
+    choice = _ask("  选择 [1]: ", "1")
 
-    # ── Phase 2 + 3: 验证 + 输出 ──
-    reporter = Reporter(args.output)
+    if choice.isdigit() and 1 <= int(choice) <= len(PRESETS):
+        sni = PRESETS[int(choice) - 1][0]
+    else:
+        sni = _ask("  输入 SNI: ", "")
+        if not sni:
+            print("未输入 SNI，退出")
+            return 2
+
+    cf_domain = _ask(f"\n📌 你的 CF 域名（用于 Step 2 验证）[{CF_PROBE_DOMAIN}]: ", CF_PROBE_DOMAIN)
+
+    src = _ask("\n📌 目标来源  [1] IP 清单文件  [2] CT 日志  [3] TLS 账本目录  [1]: ", "1")
+    targets: set[tuple[str, int]] = set()
+    ports = list(DEFAULT_PORTS)
+
+    if src == "2":
+        from fetcher import fetch_ct_logs
+
+        print("  抓取 CT 日志中...")
+        targets |= await fetch_ct_logs(sni, ports, args.timeout, retries=args.ct_retries)
+    elif src == "3":
+        ledger = _ask("  账本目录: ", "")
+        if ledger:
+            targets |= await fetch_tls_ledger(ledger, sni, assume_port=args.assume_port)
+    else:
+        path = _ask("  IP 清单路径（每行 ip 或 ip:port）: ", "")
+        if path:
+            try:
+                targets |= set(parse_targets_file(path, default_port=443))
+            except Exception as exc:
+                print(f"  读取失败: {exc}")
+                return 2
+
+    if not targets:
+        print(_empty_hint(), file=sys.stderr)
+        return 2
+
+    cc = _ask(f"\n📌 并发 [{args.concurrency}]: ", str(args.concurrency))
+    try:
+        args.concurrency = max(1, int(cc))
+    except ValueError:
+        pass
+
+    print(f"\n▶ 验证 {len(targets)} 个目标（并发 {args.concurrency}）\n")
+    reset_stats()
+    reporter = Reporter(args.output, fmt=args.format)
     reporter.start()
-
-    logger.info(f"[Phase 2] 双重 TLS 交叉验证 (并发 {args.concurrency})")
     async for result in verify_batch(
-        target_list, snis, CF_PROBE_DOMAIN,
-        concurrency=args.concurrency,
-        timeout=args.timeout,
+        sorted(targets), [sni], cf_domain,
+        concurrency=args.concurrency, timeout=args.timeout,
         redundancy_check=not args.no_redundancy,
     ):
         reporter.on_result(result)
-
     reporter.finish()
-    logger.info(f"完成 — 结果 → {args.output}")
+    print_summary(get_stats().dump())
+    return 0
+
+
+def _ask(prompt: str, default: str) -> str:
+    try:
+        val = input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    return val or default
+
+
+# ══════════════════════════════════════════════════════════════
+# 入口
+# ══════════════════════════════════════════════════════════════
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="reality-cf",
+        description="REALITY-CF 节点发现：CT 日志 / TLS 账本 / 自备清单 + 双重 TLS 验证",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--sni", help="目标大厂 SNI，如 images.apple.com")
+    p.add_argument("--sni-list", action="append", metavar="FILE",
+                   help="SNI 列表文件（一行一个），可重复")
+    p.add_argument("--cf-domain", default=CF_PROBE_DOMAIN,
+                   help=f"Step 2 使用的 Cloudflare 域名（默认 {CF_PROBE_DOMAIN}）")
+    p.add_argument("--targets", action="append", metavar="FILE",
+                   help="自备目标清单（一行 ip 或 ip:port），可重复")
+
+    p.add_argument("--ledger", help="TLS 账本目录")
+    p.add_argument("--ledger-cache", default="./scans", help="账本缓存目录（默认 ./scans）")
+    p.add_argument("--ledger-limit", type=int, default=1, help="自动下载最新 N 个账本文件（默认 1）")
+    p.add_argument("--auto-ledger", action=argparse.BooleanOptionalAction, default=False,
+                   help="自动下载 TLS 账本（需要 SONAR_API_KEY）")
+    p.add_argument("--no-ct", action="store_true", help="跳过 CT 日志阶段")
+    p.add_argument("--no-ledger", action="store_true", help="跳过 TLS 账本阶段")
+    p.add_argument("--assume-port", type=int, help="账本里没有端口信息时假定的端口")
+
+    p.add_argument("--ports", default=",".join(map(str, DEFAULT_PORTS)),
+                   help=f"端口嗅探列表（默认 {','.join(map(str, DEFAULT_PORTS))}）")
+    p.add_argument("--concurrency", type=int, default=500, help="验证并发（默认 500）")
+    p.add_argument("--timeout", type=float, default=3.0, help="单次握手超时秒（默认 3.0）")
+    p.add_argument("--ct-retries", type=int, default=3, help="crt.sh 重试次数（默认 3）")
+    p.add_argument("--output", default="vuln_reality_cf_report.json", help="输出文件")
+    p.add_argument("--format", choices=("json", "jsonl"), default="json", help="输出格式")
+    p.add_argument("--no-redundancy", action="store_true", help="关闭反蜜罐检测（不建议）")
+    return p
+
+
+async def amain() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not args.sni and not args.sni_list:
+        if len(sys.argv) == 1:
+            return await menu_mode(args)
+        parser.error("需要 --sni 或 --sni-list（无参数运行进入交互菜单）")
+
+    return await run(args)
+
+
+def main() -> None:
+    try:
+        sys.exit(asyncio.run(amain()))
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print()
-        logger.info("用户中断")
+    main()

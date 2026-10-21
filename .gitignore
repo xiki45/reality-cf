@@ -1,1 +1,20 @@
 __pycache__/
+*.py[cod]
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# Sonar 账本下载缓存（体积大，不入库）
+scans/
+*.sonar.gz
+*.sonar
+manifest.json
+
+# GeoIP 数据库与本地扫描产物
+*.mmdb
+output*.json
+output*.jsonl
+results*.json
+results*.jsonl
