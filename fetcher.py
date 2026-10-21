@@ -21,10 +21,12 @@ import logging
 import re
 from pathlib import Path
 
+from targets import parse_links_file  # noqa: F401  (对外暴露)
+
 logger = logging.getLogger("reality-cf.fetcher")
 
 __all__ = [
-    "fetch_ct_logs", "fetch_tls_ledger", "parse_targets_file",
+    "fetch_ct_logs", "fetch_tls_ledger", "parse_targets_file", "parse_links_file",
     "DEFAULT_PORTS",
 ]
 
@@ -368,31 +370,9 @@ def _pick_port(rec: dict) -> int | None:
 # 手工目标清单
 # ══════════════════════════════════════════════════════════════
 
-def parse_targets_file(path: str, default_port: int = 443) -> list[tuple[str, int]]:
-    """
-    读 --targets 文件。每行 `ip:port` / `ip` / `host:port`，`#` 开头为注释。
-    不带端口的行用 default_port 补齐。
-    """
-    targets: list[tuple[str, int]] = []
-    seen: set[tuple[str, int]] = set()
-    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-        for lineno, raw in enumerate(fh, 1):
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            host, _, port_s = line.partition(":")
-            host = host.strip()
-            port = default_port
-            if port_s.strip():
-                try:
-                    port = int(port_s.strip())
-                except ValueError:
-                    logger.warning("  %s:%d 端口非法，跳过: %s", path, lineno, line)
-                    continue
-            if not host:
-                continue
-            key = (host, port)
-            if key not in seen:
-                seen.add(key)
-                targets.append(key)
-    return targets
+def parse_targets_file(path: str, default_port: int = 443):
+    """兼容入口：实现见 targets.py（支持 host:port:sni 三列）。"""
+    from targets import parse_targets_file as _impl
+
+    return _impl(path, default_port=default_port)
+

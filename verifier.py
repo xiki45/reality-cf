@@ -359,8 +359,7 @@ async def verify_batch(
     固定数量 worker + 有界队列：目标再多也不会一次性建出 N 个 Task（v1 会）。
     """
     snis = [s for s in target_snis if s]
-    if not snis:
-        return
+    # 注意：snis 可以为空 —— 只要每个 target 自带 SNI（--links / host:port:sni）就能跑。
 
     nworkers = max(1, int(concurrency))
     in_q: asyncio.Queue = asyncio.Queue(maxsize=nworkers * 4)
@@ -369,8 +368,12 @@ async def verify_batch(
 
     async def producer():
         try:
-            for ip, port in targets:
-                for sni in snis:
+            for target in targets:
+                # 支持 (ip, port) 与 (ip, port, sni) 两种形态：
+                # 后者是「不盲扫」——目标只跟它自己的 SNI 配对，不做笛卡尔积。
+                ip, port = target[0], target[1]
+                own = target[2] if len(target) > 2 else ""
+                for sni in ([own] if own else snis):
                     await in_q.put((ip, port, sni))
         finally:
             for _ in range(nworkers):

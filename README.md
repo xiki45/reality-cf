@@ -19,29 +19,60 @@ Xray 会把原始流量直接转发给 `target`。于是：
 
 ```
 普通 REALITY 节点 (target = 苹果源站)
-  客户端 --SNI=你的CF域名--> 节点 --原样转发--> 苹果源站
-                                              └─ 不认这个 SNI，握手失败 → 你什么也拿不到
+  客户端 --SNI=任意域名--> 节点 --原样转发--> 苹果源站
+                                          └─ 收到的是苹果的证书，与你的 SNI 不匹配 → 丢弃
 
 target 在 CF 后面的节点 (target = 某个 CF 站点)
-  客户端 --SNI=你的CF域名--> 节点 --原样转发--> CF 边缘 --认这个SNI--> 你的站点，带 cf-ray
-                                              └─ 这台节点就成了 CF 的端口转发器
+  客户端 --SNI=任意域名--> 节点 --原样转发--> CF 边缘
+                                          └─ CF 愿意为该 SNI 出证书 + 回 cf-ray → 命中
 ```
 
-所以本工具测的不是「SNI 白名单没配」，而是「**节点的 target 位于 Cloudflare**」。
-满足这一条的节点，任何人都能借它当 CF 反代用。
+所以本工具测的是「**节点的 target 由 Cloudflare 承接**」这件事，不是「serverNames 没配」。
+
+### ⚠️ 关键前提：一个目标只跟它自己的 SNI 配对
+
+这是**最容易写错、也是旧版 README 写错的地方**：不能用固定一个 SNI（例如 `images.apple.com`）
+去问所有节点。每个节点的 REALITY dest 各不相同，别人的 SNI 只会换来 `name_mismatch` ——
+实测 1118 个真实节点用固定 SNI 扫描，命中 **0**，而 104 条落进「证书不匹配」。
+
+正确做法是让每个目标带上它订阅里自己的 SNI：
+
+```bash
+reality-cf --links sub.txt --cf-domain probe.example.com        # 推荐：链接自带 SNI + 凭证
+reality-cf --targets nodes.txt --cf-domain probe.example.com    # nodes.txt 用 host:port:sni 三列
+```
 
 ### 三步验证（任一失败即丢弃，原因计入统计）
 
 | 步骤 | 动作 | 通过条件 |
 |------|------|----------|
-| Step 1 | 用大厂 SNI 握手，读 DER 证书 | 证书 **SAN** 覆盖该 SNI（`*.apple.com` 只匹配一级；CN 仅在无 SAN 时回退） |
+| Step 1 | 用目标自己的 SNI 握手，读 DER 证书 | 证书 **SAN** 覆盖该 SNI（`*.apple.com` 只匹配一级；CN 仅在无 SAN 时回退） |
 | Step 2 | 换 `--cf-domain` 再握手 + 发 `GET /` | 响应含 `cf-ray` 或 `server: cloudflare` |
 | Step 3 | 用 RFC 2606 保留域 `.invalid` 随机 SNI 再试 | **不能**再回 CF 头，否则判定为蜜罐 / 无差别反代 |
 
-> **能力边界（务必知道）**：纯 TLS 层无法区分「REALITY 节点」和「普通 SNI 代理 / 端口转发」——
-> REALITY 对未认证连接就是透传，客户端看到的是 target 的真证书。
-> 因此输出里的 `confidence=high` 含义是「**确认可被当 CF 反代使用**」，不是「确认是 REALITY」。
-> 要 100% 确认协议身份，需在节点上跑 `xray tls ping` 或对 inner protocol 做探测。
+`--cf-domain` 只是探针标记，**不需要是你自己的域名**，任何托管在 Cloudflare 的域名都行
+（实测哪怕灰云未代理的域名，只要在 CF zone 内，CF 边缘照样出证书）。
+
+### 第四步：认证复核（可选，`--verify-auth`）
+
+前三步只能证明「未认证流量被透传到 CF」，证明不了三件事：是不是 REALITY、凭证还有没有效、节点是否活着。
+`--verify-auth` 会调用本机真实内核跑一次完整 REALITY 握手（X25519 + HKDF + AES-GCM short-id），
+失败原因按语义分类：
+
+| `auth_error` | 含义 | 该怎么处理 |
+|---|---|---|
+| `""`（`usable: true`） | 真 REALITY，凭证有效，能用 | 直接用 |
+| `auth_failed` | 真 REALITY，但 `uuid`/`pbk`/`short-id` 已失效 | 换新鲜订阅 |
+| `not_reality` | 端口返回了**真实证书** → 根本不是 REALITY，只是 TLS 反代 | 丢弃（这是前三步无法识别的假阳性） |
+| `timeout` | 连不上 / 无响应 | 节点已死 |
+| `eof` / `refused` | 被对端关闭 / 拒绝 | 节点已死或封了你的 IP |
+| `no_credentials` | 目标是裸 IP，没有 uuid/pbk 可复核 | 改用 `--links` |
+
+内核自动探测，顺序：Clash Party / Mihomo Party 的 sidecar mihomo → PATH 里的 mihomo → xray；
+也可用 `--core PATH` 显式指定。
+
+> **能力边界**：不跑 `--verify-auth` 时，`confidence=high` 的含义仅为
+> 「**确认可被当 CF 反代使用**」，不等于「确认是 REALITY、确认能用」。
 
 ---
 
@@ -60,10 +91,18 @@ python3 -m venv .venv
 
 要求 **Python 3.10+**（代码用了 `X | None` 注解与 `argparse.BooleanOptionalAction`）。
 
-### 三种目标来源（可任意组合）
+### 四种目标来源（可任意组合）
 
 ```bash
-# A) 自备 IP 清单 —— 最可靠，不依赖任何第三方 API
+# A0) 订阅分享链接 —— 首选：一条链接就带 host/port/SNI/uuid/pbk/sid，不盲扫
+reality-cf --links sub.txt --cf-domain probe.example.com
+
+# A) 自备 IP 清单 —— 不依赖任何第三方 API；三列格式可指定每行的 SNI
+cat > nodes.txt <<'EOF'
+1.2.3.4:443:images.apple.com
+[2001:db8::1]:8443:www.cloudflare.com
+5.6.7.8:8443
+EOF
 cat > ips.txt <<'EOF'
 1.2.3.4
 5.6.7.8:8443
@@ -101,7 +140,8 @@ python3 main.py --sni images.apple.com --auto-ledger --ledger-limit 1 --cf-domai
 | `--sni` | 目标大厂 SNI，如 `images.apple.com` |
 | `--sni-list FILE` | SNI 列表文件（一行一个），可重复 |
 | `--cf-domain` | Step 2 用的 CF 域名，默认 `speed.cloudflare.com` |
-| `--targets FILE` | 自备目标清单（`ip` 或 `ip:port`），可重复 |
+| `--targets FILE` | 自备目标清单（`host` / `host:port` / `host:port:sni`），可重复 |
+| `--links FILE` | `vless://` 链接文件（自带每节点 SNI 与 REALITY 凭证），可重复 |
 | `--ledger DIR` | TLS 账本目录 |
 | `--ledger-cache DIR` | 账本缓存目录，默认 `./scans` |
 | `--auto-ledger` / `--no-auto-ledger` | 是否自动下载账本（需 `SONAR_API_KEY`），默认关 |
@@ -116,6 +156,9 @@ python3 main.py --sni images.apple.com --auto-ledger --ledger-limit 1 --cf-domai
 | `--output` | 输出文件，默认 `vuln_reality_cf_report.json` |
 | `--format` | `json`（数组）或 `jsonl`（逐行，边跑边可读） |
 | `--no-redundancy` | 关闭反蜜罐（不建议；只在你确认数据源干净时用） |
+| `--verify-auth` | 对命中节点用本机真实内核做 REALITY 认证复核 |
+| `--core PATH` | 客户端内核路径（默认自动探测 Clash Party / Mihomo Party / mihomo / xray） |
+| `--auth-timeout N` | 认证复核单节点超时秒，默认 9.0 |
 
 ---
 

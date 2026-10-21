@@ -88,7 +88,13 @@ class Reporter:
         if self._tmp is not None:
             os.replace(self._tmp, self.output_path)   # 原子替换
             self._tmp = None
-        logger.info("共发现 %d 个可用节点 → %s（%s）", self.count, self.output_path, self.fmt)
+        usable = sum(1 for r in getattr(self, "_rows", []) if r.get("usable") is True)
+        if any(r.get("usable") is not None for r in getattr(self, "_rows", [])):
+            logger.info("共发现 %d 个命中，其中认证可用 %d 个 → %s（%s）",
+                        self.count, usable, self.output_path, self.fmt)
+        else:
+            logger.info("共发现 %d 个命中（未经认证复核）→ %s（%s）",
+                        self.count, self.output_path, self.fmt)
         return self.count
 
     def abort(self) -> None:
@@ -108,17 +114,26 @@ class Reporter:
 
     # ── 展示 ──
     def _print_row(self, r: dict) -> None:
+        self._rows = getattr(self, "_rows", [])
+        self._rows.append(r)
         geo = r.get("geo") or {}
         loc = geo.get("country") or "??"
         if geo.get("city"):
             loc += "/" + str(geo["city"])
         asn = geo.get("asn") or ""
         ev = r.get("evidence") or {}
-        tag = f"{C_GREEN}✅{C_RESET}"
+        usable = r.get("usable")
+        if usable is True:
+            tag = f"{C_GREEN}✅ 可用{C_RESET}"
+        elif usable is False:
+            tag = f"{C_YELLOW}⚠️  {r.get('auth_error') or '不可用'}{C_RESET}"
+        else:
+            tag = f"{C_GREEN}✅{C_RESET}"
+        extra = "" if usable is None else f"  {C_DIM}auth={r.get('auth_error') or 'ok'}{C_RESET}"
         print(
             f"  {tag} {C_CYAN}{r.get('ip')}:{r.get('port')}{C_RESET}  "
             f"{C_YELLOW}{r.get('target_sni')}{C_RESET}  [{loc}] "
-            f"{C_DIM}{asn} cf-ray={ev.get('cf_ray') or '-'}{C_RESET}"
+            f"{C_DIM}{asn} cf-ray={ev.get('cf_ray') or '-'}{C_RESET}{extra}"
         )
 
 
@@ -137,6 +152,19 @@ def print_summary(stats: dict) -> None:
         print(f"  Step2 握手失败  {stats.get('step2_tls_fail', 0)}")
         print(f"  无 CF 特征头    {stats.get('no_cf', 0)}")
         print(f"  判定为蜜罐      {stats.get('honeypot', 0)}")
+    auth = stats.get("auth") or {}
+    if auth:
+        print(f"  认证可用        {C_GREEN}{auth.get('usable', 0)}{C_RESET}")
+        if auth.get("auth_failed"):
+            print(f"  凭证失效        {auth['auth_failed']}   ← 真 REALITY 但 uuid/pbk/sid 已过期")
+        if auth.get("not_reality"):
+            print(f"  不是 REALITY    {auth['not_reality']}   ← 收到真证书，实为普通 TLS 反代")
+        if auth.get("timeout"):
+            print(f"  复核超时        {auth['timeout']}")
+        if auth.get("other"):
+            print(f"  无法复核        {auth['other']}   ← 缺凭证或内核未找到")
+    if stats.get("dup_hit"):
+        print(f"  重复命中(忽略)  {stats['dup_hit']}   ← --sni-list 笛卡尔积放大的部分")
     if stats.get("errors"):
         print(f"  异常            {stats['errors']}")
     if total and not hit:

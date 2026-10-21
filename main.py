@@ -26,7 +26,9 @@ import asyncio
 import logging
 import sys
 
-from fetcher import DEFAULT_PORTS, fetch_ct_logs, fetch_tls_ledger, parse_targets_file
+from fetcher import (
+    DEFAULT_PORTS, fetch_ct_logs, fetch_tls_ledger, parse_links_file, parse_targets_file,
+)
 from reporter import Reporter, print_summary
 from verifier import get_stats, reset_stats, verify_batch
 
@@ -45,8 +47,32 @@ PRESETS = [
 # 资产收集编排
 # ══════════════════════════════════════════════════════════════
 
-async def collect_targets(args, snis: list[str], ports: list[int]) -> set[tuple[str, int]]:
-    targets: set[tuple[str, int]] = set()
+async def collect_targets(args, snis: list[str], ports: list[int]):
+    """
+    返回 (targets, nodes)。
+
+    targets 里每项是 (host, port, sni)：sni 非空表示「只用它自己的 SNI 配对」
+    （不盲扫）；为空表示「跟全局 --sni/--sni-list 逐一配对」。
+    nodes 是 vless:// 链接解析出的完整凭证，供 --verify-auth 使用。
+    """
+    targets: set[tuple[str, int, str]] = set()
+    nodes: dict[tuple[str, int, str], dict] = {}
+
+    # 0: 订阅分享链接（自带 SNI + REALITY 凭证）
+    for path in args.links or []:
+        try:
+            got = parse_links_file(path)
+        except FileNotFoundError:
+            logger.error("链接文件不存在: %s", path)
+            continue
+        except Exception as exc:
+            logger.error("链接文件解析失败 %s: %s", path, exc)
+            continue
+        for n in got:
+            key = (n["host"], n["port"], n["sni"].lower())
+            targets.add(key)
+            nodes.setdefault(key, n)
+        logger.info("[Phase 0] 订阅链接 %s → %d 个 REALITY 节点（自带 SNI）", path, len(got))
 
     # C: 手工清单（最先加载，保证即使外网全挂也能跑）
     for path in args.targets or []:
@@ -65,7 +91,7 @@ async def collect_targets(args, snis: list[str], ports: list[int]) -> set[tuple[
             logger.info("[Phase 1A] CT 日志: %s", sni)
             got = await fetch_ct_logs(sni, ports, args.timeout, retries=args.ct_retries)
             logger.info("  → %d 个候选", len(got))
-            targets.update(got)
+            targets.update((ip, port, "") for ip, port in got)
 
     # B: TLS 账本
     if not args.no_ledger:
@@ -79,17 +105,18 @@ async def collect_targets(args, snis: list[str], ports: list[int]) -> set[tuple[
                 logger.info("[Phase 1B] TLS 账本: %s", sni)
                 got = await fetch_tls_ledger(ledger_dir, sni, assume_port=args.assume_port)
                 logger.info("  → %d 个候选", len(got))
-                targets.update(got)
+                targets.update((ip, port, "") for ip, port in got)
         elif args.ledger:
             logger.error("账本目录不可用: %s", args.ledger)
 
-    return targets
+    return targets, nodes
 
 
 def _empty_hint() -> str:
     return (
-        "没有拿到任何候选目标。三条路任选其一：\n"
-        "  1) 给 IP 清单（最可靠）：reality-cf --sni <大厂域名> --targets ips.txt --cf-domain <你的CF域名>\n"
+        "没有拿到任何候选目标。四条路任选其一：\n"
+        "  0) 给订阅链接（首选，自带每节点 SNI）：reality-cf --links sub.txt --cf-domain <CF域名> --verify-auth\n"
+        "  1) 给 IP 清单：reality-cf --targets ips.txt --cf-domain <你的CF域名>\n"
         "  2) 给账本目录：--ledger <目录>（目录内放 *.json.gz，每条含 ip/port/server_name）\n"
         "  3) 修好外网数据源：crt.sh 或配置 SONAR_API_KEY 后加 --auto-ledger\n"
         "  注：CT 日志只能枚举域名（不含 IP），单靠它扫不到第三方中转节点。"
@@ -105,19 +132,39 @@ async def run(args) -> int:
     ports = _parse_ports(args.ports)
 
     logger.info("目标 SNI: %s | CF 域名: %s | 端口: %s",
-                ", ".join(snis), args.cf_domain, ",".join(map(str, ports)))
+                ", ".join(snis) or "(仅用各目标自带 SNI)", args.cf_domain, ",".join(map(str, ports)))
 
-    targets = await collect_targets(args, snis, ports)
+    targets, nodes = await collect_targets(args, snis, ports)
     if not targets:
         print(_empty_hint(), file=sys.stderr)
         return 2
 
-    logger.info("总计 %d 个待验证 IP:PORT（并发 %d，超时 %.1fs）",
-                len(targets), args.concurrency, args.timeout)
+    own_sni = sum(1 for t in targets if t[2])
+    logger.info("总计 %d 个待验证目标（其中 %d 个自带 SNI）| 并发 %d | 超时 %.1fs",
+                len(targets), own_sni, args.concurrency, args.timeout)
 
     reset_stats()
     reporter = Reporter(args.output, fmt=args.format)
     reporter.start()
+
+    seen: set[tuple[str, int]] = set()
+    dup = 0
+    buffered: list[dict] = []
+
+    async def handle(result: dict | None) -> None:
+        nonlocal dup
+        if not result:
+            return
+        key = (result["ip"], result["port"])
+        if key in seen:
+            dup += 1
+            if not args.verify_auth:
+                return
+        seen.add(key)
+        if args.verify_auth:
+            buffered.append(result)
+        else:
+            reporter.on_result(result)
 
     try:
         async for result in verify_batch(
@@ -126,16 +173,73 @@ async def run(args) -> int:
             timeout=args.timeout,
             redundancy_check=not args.no_redundancy,
         ):
-            reporter.on_result(result)
+            await handle(result)
     except KeyboardInterrupt:
         reporter.abort()
         logger.warning("已中断，已发现的结果已落盘 → %s", args.output)
-        print_summary(get_stats().dump())
+        st = get_stats().dump()
+        st["dup_hit"] = dup
+        print_summary(st)
         return 130
 
+    # ── Phase 4: 真实客户端认证复核（可选） ──
+    auth_counts = None
+    if args.verify_auth and buffered:
+        auth_counts = await _run_auth_stage(args, buffered, nodes)
+        for result in buffered:
+            reporter.on_result(result)
+        if auth_counts is not None:
+            logger.info("认证复核：%d/%d 可用", auth_counts["usable"], len(buffered))
+    elif args.verify_auth:
+        logger.warning("--verify-auth 已开启但没有命中节点，跳过认证复核")
+
     reporter.finish()
-    print_summary(get_stats().dump())
+    st = get_stats().dump()
+    st["dup_hit"] = dup
+    if args.verify_auth and buffered:
+        st["auth"] = auth_counts
+    print_summary(st)
     return 0 if reporter.count or get_stats().total else 1
+
+
+async def _run_auth_stage(args, results: list[dict], nodes: dict) -> int:
+    """用本机真实内核逐条做 REALITY 认证复核，结果写回 result["usable"]/["auth_error"]。"""
+    from authcheck import find_core, verify_node
+
+    found = find_core(args.core)
+    if not found:
+        for r in results:
+            r["usable"] = None
+            r["auth_error"] = "no_core"
+        logger.warning(
+            "未找到可用的客户端内核，跳过认证复核。可显式指定："
+            "--core '/Applications/Clash Party.app/Contents/Resources/sidecar/mihomo'"
+        )
+        return None
+
+    core, kind = found
+    logger.info("认证复核内核: %s (%s)", core, kind)
+
+    counts = {"usable": 0, "auth_failed": 0, "not_reality": 0, "timeout": 0, "other": 0}
+    for r in results:
+        key = (r["ip"], r["port"], str(r.get("target_sni", "")).lower())
+        node = nodes.get(key)
+        if not node:
+            # 目标来自 IP 清单/账本，没有 uuid/pbk，无法做认证
+            r["usable"] = None
+            r["auth_error"] = "no_credentials"
+            counts["other"] += 1
+            continue
+        info = verify_node(core, kind, node, timeout=args.auth_timeout)
+        r.update(info)
+        if info["usable"]:
+            counts["usable"] += 1
+            logger.info("  ✅ %s:%s 认证通过", r["ip"], r["port"])
+        else:
+            err = info["auth_error"]
+            counts[err if err in counts else "other"] += 1
+            logger.info("  ❌ %s:%s %s", r["ip"], r["port"], err)
+    return counts
 
 
 def _load_snis(args) -> list[str]:
@@ -197,18 +301,20 @@ async def menu_mode(args) -> int:
     cf_domain = _ask(f"\n📌 你的 CF 域名（用于 Step 2 验证）[{CF_PROBE_DOMAIN}]: ", CF_PROBE_DOMAIN)
 
     src = _ask("\n📌 目标来源  [1] IP 清单文件  [2] CT 日志  [3] TLS 账本目录  [1]: ", "1")
-    targets: set[tuple[str, int]] = set()
+    targets: set[tuple[str, int, str]] = set()
     ports = list(DEFAULT_PORTS)
 
     if src == "2":
         from fetcher import fetch_ct_logs
 
         print("  抓取 CT 日志中...")
-        targets |= await fetch_ct_logs(sni, ports, args.timeout, retries=args.ct_retries)
+        targets |= {(ip, port, "") for ip, port in await fetch_ct_logs(
+            sni, ports, args.timeout, retries=args.ct_retries)}
     elif src == "3":
         ledger = _ask("  账本目录: ", "")
         if ledger:
-            targets |= await fetch_tls_ledger(ledger, sni, assume_port=args.assume_port)
+            targets |= {(ip, port, "") for ip, port in await fetch_tls_ledger(
+                ledger, sni, assume_port=args.assume_port)}
     else:
         path = _ask("  IP 清单路径（每行 ip 或 ip:port）: ", "")
         if path:
@@ -268,7 +374,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cf-domain", default=CF_PROBE_DOMAIN,
                    help=f"Step 2 使用的 Cloudflare 域名（默认 {CF_PROBE_DOMAIN}）")
     p.add_argument("--targets", action="append", metavar="FILE",
-                   help="自备目标清单（一行 ip 或 ip:port），可重复")
+                   help="自备目标清单（一行 host / host:port / host:port:sni），可重复")
+    p.add_argument("--links", action="append", metavar="FILE",
+                   help="vless:// 分享链接文件（推荐：自带每节点 SNI 与 REALITY 凭证），可重复")
 
     p.add_argument("--ledger", help="TLS 账本目录")
     p.add_argument("--ledger-cache", default="./scans", help="账本缓存目录（默认 ./scans）")
@@ -287,6 +395,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", default="vuln_reality_cf_report.json", help="输出文件")
     p.add_argument("--format", choices=("json", "jsonl"), default="json", help="输出格式")
     p.add_argument("--no-redundancy", action="store_true", help="关闭反蜜罐检测（不建议）")
+
+    g = p.add_argument_group("认证复核（真实客户端，可选）")
+    g.add_argument("--verify-auth", action="store_true",
+                   help="对命中节点用本机内核跑一次完整 REALITY 握手，判定「是否真能用」")
+    g.add_argument("--core", metavar="PATH",
+                   help="客户端内核路径（默认自动探测 Clash Party / Mihomo Party / xray）")
+    g.add_argument("--auth-timeout", type=float, default=9.0,
+                   help="认证复核单节点超时秒（默认 9.0）")
     return p
 
 
@@ -294,10 +410,10 @@ async def amain() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    if not args.sni and not args.sni_list:
+    if not args.sni and not args.sni_list and not args.links:
         if len(sys.argv) == 1:
             return await menu_mode(args)
-        parser.error("需要 --sni 或 --sni-list（无参数运行进入交互菜单）")
+        parser.error("需要 --sni / --sni-list / --links 之一（无参数运行进入交互菜单）")
 
     return await run(args)
 
