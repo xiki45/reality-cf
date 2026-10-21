@@ -202,8 +202,10 @@ async def run(args) -> int:
     return 0 if reporter.count or get_stats().total else 1
 
 
-async def _run_auth_stage(args, results: list[dict], nodes: dict) -> int:
+async def _run_auth_stage(args, results: list[dict], nodes: dict):
     """用本机真实内核逐条做 REALITY 认证复核，结果写回 result["usable"]/["auth_error"]。"""
+    import asyncio as _aio
+
     from authcheck import find_core, verify_node
 
     found = find_core(args.core)
@@ -218,9 +220,8 @@ async def _run_auth_stage(args, results: list[dict], nodes: dict) -> int:
         return None
 
     core, kind = found
-    logger.info("认证复核内核: %s (%s)", core, kind)
-
     counts = {"usable": 0, "auth_failed": 0, "not_reality": 0, "timeout": 0, "other": 0}
+    todo = []
     for r in results:
         key = (r["ip"], r["port"], str(r.get("target_sni", "")).lower())
         node = nodes.get(key)
@@ -230,15 +231,25 @@ async def _run_auth_stage(args, results: list[dict], nodes: dict) -> int:
             r["auth_error"] = "no_credentials"
             counts["other"] += 1
             continue
-        info = verify_node(core, kind, node, timeout=args.auth_timeout)
+        todo.append((r, node))
+
+    workers = max(1, int(getattr(args, "auth_concurrency", 4) or 1))
+    logger.info("认证复核内核: %s (%s) | %d 个节点 | 并发 %d", core, kind, len(todo), workers)
+    lock = _aio.Lock()
+
+    async def one(r: dict, node: dict) -> None:
+        info = await _aio.to_thread(verify_node, core, kind, node, args.auth_timeout)
         r.update(info)
-        if info["usable"]:
-            counts["usable"] += 1
-            logger.info("  ✅ %s:%s 认证通过", r["ip"], r["port"])
-        else:
-            err = info["auth_error"]
-            counts[err if err in counts else "other"] += 1
-            logger.info("  ❌ %s:%s %s", r["ip"], r["port"], err)
+        async with lock:
+            if info["usable"]:
+                counts["usable"] += 1
+                logger.info("  ✅ %s:%s 认证通过", r["ip"], r["port"])
+            else:
+                err = info["auth_error"]
+                counts[err if err in counts else "other"] += 1
+                logger.info("  ❌ %s:%s %s", r["ip"], r["port"], err)
+
+    await _aio.gather(*(one(r, n) for r, n in todo))
     return counts
 
 
@@ -403,6 +414,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="客户端内核路径（默认自动探测 Clash Party / Mihomo Party / xray）")
     g.add_argument("--auth-timeout", type=float, default=9.0,
                    help="认证复核单节点超时秒（默认 9.0）")
+    g.add_argument("--auth-concurrency", type=int, default=4,
+                   help="认证复核并发（每个并发会起一个内核进程，默认 4）")
     return p
 
 
