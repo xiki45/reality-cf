@@ -19,3 +19,6 @@ output*.jsonl
 results*.json
 results*.jsonl
 auth_cache.json
+relay_state.json
+live_relays.txt
+.DS_Store

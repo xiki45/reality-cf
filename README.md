@@ -29,6 +29,17 @@ target 在 CF 后面的节点 (target = 某个 CF 站点)
 
 所以本工具测的是「**节点的 target 由 Cloudflare 承接**」这件事，不是「serverNames 没配」。
 
+### 这个工具到底在找什么
+
+找的是「**别人的机器，当前会把未认证流量转发给 Cloudflare**」。
+
+- REALITY 对认证失败的连接不做任何检查，原样转发给 dest —— 所以任何人**不带任何凭证**
+  就能借这台机器进 CF，把它当中转用。这是本项目的核心产出。
+- 因此**判定标准只有 TLS 层三步验证**，与 `uuid/pbk/sid` 无关。
+  客户端能不能当「用户」登录（`--verify-auth`）是另一件事，属于自用场景，不是这里的目标。
+- 目标机器会轮换 dest 来反制（实测同一批 DMIT 机器 50 分钟内从 540 台掉到 2 台），
+  所以产出必须带**新鲜度**，见下面的「保鲜与轮换监控」。
+
 ### ⚠️ 关键前提：一个目标只跟它自己的 SNI 配对
 
 这是**最容易写错、也是旧版 README 写错的地方**：不能用固定一个 SNI（例如 `images.apple.com`）
@@ -53,7 +64,11 @@ reality-cf --targets nodes.txt --cf-domain probe.example.com    # nodes.txt 用 
 `--cf-domain` 只是探针标记，**不需要是你自己的域名**，任何托管在 Cloudflare 的域名都行
 （实测哪怕灰云未代理的域名，只要在 CF zone 内，CF 边缘照样出证书）。
 
-### 第四步：认证复核（可选，`--verify-auth`）
+### （可选，自用场景）认证复核 `--verify-auth`
+
+> 只有你想拿这套凭证「当用户连上去」时才需要这一步。
+> 对「找可白嫖的第三方中转」这个主目标，`auth_failed` **不代表不能用** ——
+> 反而说明机器活着、REALITY 在跑，正是最适合借道的目标。
 
 前三步只能证明「未认证流量被透传到 CF」，证明不了三件事：是不是 REALITY、凭证还有没有效、节点是否活着。
 `--verify-auth` 会调用本机真实内核跑一次完整 REALITY 握手（X25519 + HKDF + AES-GCM short-id），
@@ -73,6 +88,30 @@ reality-cf --targets nodes.txt --cf-domain probe.example.com    # nodes.txt 用 
 
 > **能力边界**：不跑 `--verify-auth` 时，`confidence=high` 的含义仅为
 > 「**确认可被当 CF 反代使用**」，不等于「确认是 REALITY、确认能用」。
+
+---
+
+### 保鲜与轮换监控（本项目推荐的工作模式）
+
+单次扫描的结果有保鲜期，别当快照用。持续复测：
+
+```bash
+# 每 10 分钟扫一轮，共 6 轮；每轮结束都刷新可用清单
+reality-cf --ranges dmit.txt --ports 443 \
+  --sni www.cloudflare.com --cf-domain www.cloudflare.com \
+  --rounds 6 --recheck-interval 600 \
+  --state relay_state.json --export live_relays.txt
+```
+
+产出：
+
+- `live_relays.txt` —— 当前有效的 `ip:port:sni` 清单，边跑边刷新
+- `relay_state.json` —— 每台的 `first_seen` / `last_seen` / `alive_rounds` / `dest_history`
+- 控制台会列出「dest 发生过轮换」的机器 —— 它们通常会周期性把 dest 指回 CF，值得长期盯
+
+`--active-rounds N` 可以只导出「连续 N 轮都成立」的稳定目标。
+
+任何 CF 托管 zone 内的域名都能当 `--sni` 探针（不必是你自己的）。
 
 ---
 

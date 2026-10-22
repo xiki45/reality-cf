@@ -147,6 +147,11 @@ async def run(args) -> int:
     logger.info("目标 SNI: %s | CF 域名: %s | 端口: %s",
                 ", ".join(snis) or "(仅用各目标自带 SNI)", args.cf_domain, ",".join(map(str, ports)))
 
+    if args.rounds > 1 or args.recheck_interval > 0:
+        from monitor import run_monitor
+
+        return await run_monitor(args, collect_targets)
+
     targets, nodes = await collect_targets(args, snis, ports)
     if not targets:
         print(_empty_hint(), file=sys.stderr)
@@ -454,6 +459,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="vless:// 分享链接文件（推荐：自带每节点 SNI 与 REALITY 凭证），可重复")
     p.add_argument("--ranges", action="append", metavar="FILE",
                    help="CIDR 网段清单（按机房扫，不需要凭证），可重复")
+    g2 = p.add_argument_group("保鲜与轮换监控（本项目的默认工作模式）")
+    g2.add_argument("--rounds", type=int, default=1, help="复测轮数（默认 1）")
+    g2.add_argument("--recheck-interval", type=float, default=0,
+                    help="轮次间隔秒；>0 即进入持续监控模式")
+    g2.add_argument("--state", default="relay_state.json",
+                    help="存活状态库（默认 relay_state.json）")
+    g2.add_argument("--active-rounds", type=int, default=1,
+                    help="导出时要求累计成立轮数（默认 1，调高更稳但更少）")
+    g2.add_argument("--export", default="live_relays.txt",
+                    help="当前有效中转清单输出路径（默认 live_relays.txt）")
+    g2.add_argument("--export-sni", metavar="SNI",
+                    help="导出时统一附带的 SNI（省略则用命中时用过的 SNI）")
+
     p.add_argument("--range-max", type=int, default=200000,
                    help="网段展开后的目标数上限（默认 20 万，防误扫 /8）")
 

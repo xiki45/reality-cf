@@ -187,6 +187,34 @@ def _dnsname_match(pattern: str, hostname: str) -> bool:
     return False
 
 
+def cert_names(der_cert: bytes | None) -> list[str]:
+    """证书里所有 DNS 名（SAN 优先，CN 追加）。用于观察对端 dest 的真实身份。"""
+    if not der_cert:
+        return []
+    try:
+        cert = x509.load_der_x509_certificate(der_cert)
+    except Exception:
+        return []
+    names: list[str] = []
+    try:
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        names += [n.lower() for n in san.get_values_for_type(x509.DNSName)]
+    except Exception:
+        pass
+    try:
+        for attr in cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME):
+            v = attr.value.lower()
+            if v not in names:
+                names.append(v)
+    except Exception:
+        pass
+    return names
+
+
+#: 证书不匹配时的回调 (ip, port, cert_names)，供 monitor 记录 dest 轮换
+MISS_HOOK = None
+
+
 def cert_match(der: bytes, sni: str) -> tuple[bool, str, str]:
     """返回 (是否匹配, 命中的名字, 来源 SAN/CN)。"""
     try:
@@ -257,6 +285,11 @@ async def verify_single(
     ok, matched_name, matched_by = cert_match(der, target_sni)
     if not ok:
         _bump("name_mismatch")
+        if MISS_HOOK is not None:
+            try:
+                MISS_HOOK(ip, port, cert_names(der))
+            except Exception:
+                pass
         return None
 
     # ── Step 2: CF 反代特征 ──
