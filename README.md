@@ -180,7 +180,6 @@ python3 main.py --sni images.apple.com --auto-ledger --ledger-limit 1 --cf-domai
 | `--sni-list FILE` | SNI 列表文件（一行一个），可重复 |
 | `--cf-domain` | Step 2 用的 CF 域名，默认 `speed.cloudflare.com` |
 | `--targets FILE` | 自备目标清单（`host` / `host:port` / `host:port:sni`），可重复 |
-| `--links FILE` | `vless://` 链接文件（自带每节点 SNI 与 REALITY 凭证），可重复 |
 | `--ledger DIR` | TLS 账本目录 |
 | `--ledger-cache DIR` | 账本缓存目录，默认 `./scans` |
 | `--auto-ledger` / `--no-auto-ledger` | 是否自动下载账本（需 `SONAR_API_KEY`），默认关 |
@@ -195,9 +194,22 @@ python3 main.py --sni images.apple.com --auto-ledger --ledger-limit 1 --cf-domai
 | `--output` | 输出文件，默认 `vuln_reality_cf_report.json` |
 | `--format` | `json`（数组）或 `jsonl`（逐行，边跑边可读） |
 | `--no-redundancy` | 关闭反蜜罐（不建议；只在你确认数据源干净时用） |
-| `--verify-auth` | 对命中节点用本机真实内核做 REALITY 认证复核 |
+
+### 附录：自用节点参数（默认关闭，与借道无关）
+
+这一组只服务「把节点当客户端登录」这个场景 —— 需要 REALITY 凭证仍然有效。
+**对寻找可借道的中转没有任何帮助**：命中判据只看 TLS 层，不看能不能登录。
+
+| 参数 | 说明 |
+|---|---|
+| `--links FILE` | `vless://` 链接文件（自带每节点 SNI 与凭证），可重复 |
+| `--verify-auth` | 对命中节点用本机内核跑 REALITY 握手，判定凭证还能不能登录 |
 | `--core PATH` | 客户端内核路径（默认自动探测 Clash Party / Mihomo Party / mihomo / xray） |
 | `--auth-timeout N` | 认证复核单节点超时秒，默认 9.0 |
+| `--auth-concurrency N` | 认证复核并发（每个并发起一个内核进程），默认 4 |
+| `--min-usable N` | 凑够 N 个认证可用就提前结束（0 = 不限） |
+| `--auth-cache FILE` | 认证结果缓存文件（默认 `auth_cache.json`，传空串关闭） |
+| `--auth-cache-ttl N` | 缓存有效期秒（默认 6 小时，0 = 永不过期） |
 
 ---
 

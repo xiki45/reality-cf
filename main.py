@@ -445,21 +445,48 @@ def _ask(prompt: str, default: str) -> str:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="reality-cf",
-        description="REALITY-CF 节点发现：CT 日志 / TLS 账本 / 自备清单 + 双重 TLS 验证",
+        description=(
+            "找出「当前会把未认证流量转发给 Cloudflare」的第三方机器（可借道的中转）。\n"
+            "判定只用 TLS 三步验证，不需要任何 REALITY 凭证。\n"
+            "\n"
+            "典型用法：\n"
+            "  reality-cf --ranges dmit.txt --ports 443 --sni www.cloudflare.com \\\n"
+            "      --cf-domain www.cloudflare.com --rounds 6 --recheck-interval 600"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--sni", help="目标大厂 SNI，如 images.apple.com")
-    p.add_argument("--sni-list", action="append", metavar="FILE",
-                   help="SNI 列表文件（一行一个），可重复")
-    p.add_argument("--cf-domain", default=CF_PROBE_DOMAIN,
-                   help=f"Step 2 使用的 Cloudflare 域名（默认 {CF_PROBE_DOMAIN}）")
-    p.add_argument("--targets", action="append", metavar="FILE",
-                   help="自备目标清单（一行 host / host:port / host:port:sni），可重复")
-    p.add_argument("--links", action="append", metavar="FILE",
-                   help="vless:// 分享链接文件（推荐：自带每节点 SNI 与 REALITY 凭证），可重复")
-    p.add_argument("--ranges", action="append", metavar="FILE",
-                   help="CIDR 网段清单（按机房扫，不需要凭证），可重复")
-    g2 = p.add_argument_group("保鲜与轮换监控（本项目的默认工作模式）")
+
+    # ── 核心：判据 ──
+    g0 = p.add_argument_group("判据（三步 TLS 验证）")
+    g0.add_argument("--sni", help="目标 SNI；任选一个托管在 Cloudflare 的域名即可（不必是你的）")
+    g0.add_argument("--sni-list", action="append", metavar="FILE",
+                    help="SNI 列表文件（一行一个），可重复")
+    g0.add_argument("--cf-domain", default=CF_PROBE_DOMAIN,
+                    help=f"Step 2 的反代探针域名（默认 {CF_PROBE_DOMAIN}，可与 --sni 相同）")
+    g0.add_argument("--no-redundancy", action="store_true",
+                    help="关闭反蜜罐检测（不建议：对 .invalid 也回 CF 头的机器会看到你的明文）")
+
+    # ── 核心：目标来源 ──
+    g1 = p.add_argument_group("目标来源（任选其一或组合）")
+    g1.add_argument("--ranges", action="append", metavar="FILE",
+                    help="CIDR 网段清单（按机房扫，最有效），可重复")
+    g1.add_argument("--range-max", type=int, default=200000,
+                    help="网段展开后的目标数上限（默认 20 万，防误扫 /8）")
+    g1.add_argument("--targets", action="append", metavar="FILE",
+                    help="目标清单（一行 host / host:port / host:port:sni），可重复")
+    g1.add_argument("--ports", default=",".join(map(str, DEFAULT_PORTS)),
+                    help=f"端口列表（默认 {','.join(map(str, DEFAULT_PORTS))}；实测这类机器基本只开 443）")
+    g1.add_argument("--ledger", help="TLS 账本目录")
+    g1.add_argument("--ledger-cache", default="./scans", help="账本缓存目录（默认 ./scans）")
+    g1.add_argument("--ledger-limit", type=int, default=1, help="自动下载最新 N 个账本文件（默认 1）")
+    g1.add_argument("--auto-ledger", action=argparse.BooleanOptionalAction, default=False,
+                    help="自动下载 TLS 账本（需要 SONAR_API_KEY）")
+    g1.add_argument("--no-ct", action="store_true", help="跳过 CT 日志阶段")
+    g1.add_argument("--no-ledger", action="store_true", help="跳过 TLS 账本阶段")
+    g1.add_argument("--assume-port", type=int, help="账本里没有端口信息时假定的端口")
+
+    # ── 保鲜与轮换监控 ──
+    g2 = p.add_argument_group("保鲜与轮换监控（推荐工作模式）")
     g2.add_argument("--rounds", type=int, default=1, help="复测轮数（默认 1）")
     g2.add_argument("--recheck-interval", type=float, default=0,
                     help="轮次间隔秒；>0 即进入持续监控模式")
@@ -472,42 +499,36 @@ def build_parser() -> argparse.ArgumentParser:
     g2.add_argument("--export-sni", metavar="SNI",
                     help="导出时统一附带的 SNI（省略则用命中时用过的 SNI）")
 
-    p.add_argument("--range-max", type=int, default=200000,
-                   help="网段展开后的目标数上限（默认 20 万，防误扫 /8）")
+    # ── 性能与输出 ──
+    g3 = p.add_argument_group("性能与输出")
+    g3.add_argument("--concurrency", type=int, default=500, help="并发（默认 500）")
+    g3.add_argument("--timeout", type=float, default=3.0, help="单次握手超时秒（默认 3.0）")
+    g3.add_argument("--ct-retries", type=int, default=3, help="crt.sh 重试次数（默认 3）")
+    g3.add_argument("--output", default="vuln_reality_cf_report.json", help="输出文件")
+    g3.add_argument("--format", choices=("json", "jsonl"), default="json", help="输出格式")
 
-    p.add_argument("--ledger", help="TLS 账本目录")
-    p.add_argument("--ledger-cache", default="./scans", help="账本缓存目录（默认 ./scans）")
-    p.add_argument("--ledger-limit", type=int, default=1, help="自动下载最新 N 个账本文件（默认 1）")
-    p.add_argument("--auto-ledger", action=argparse.BooleanOptionalAction, default=False,
-                   help="自动下载 TLS 账本（需要 SONAR_API_KEY）")
-    p.add_argument("--no-ct", action="store_true", help="跳过 CT 日志阶段")
-    p.add_argument("--no-ledger", action="store_true", help="跳过 TLS 账本阶段")
-    p.add_argument("--assume-port", type=int, help="账本里没有端口信息时假定的端口")
-
-    p.add_argument("--ports", default=",".join(map(str, DEFAULT_PORTS)),
-                   help=f"端口嗅探列表（默认 {','.join(map(str, DEFAULT_PORTS))}）")
-    p.add_argument("--concurrency", type=int, default=500, help="验证并发（默认 500）")
-    p.add_argument("--timeout", type=float, default=3.0, help="单次握手超时秒（默认 3.0）")
-    p.add_argument("--ct-retries", type=int, default=3, help="crt.sh 重试次数（默认 3）")
-    p.add_argument("--output", default="vuln_reality_cf_report.json", help="输出文件")
-    p.add_argument("--format", choices=("json", "jsonl"), default="json", help="输出格式")
-    p.add_argument("--no-redundancy", action="store_true", help="关闭反蜜罐检测（不建议）")
-
-    g = p.add_argument_group("认证复核（真实客户端，可选）")
-    g.add_argument("--verify-auth", action="store_true",
-                   help="对命中节点用本机内核跑一次完整 REALITY 握手，判定「是否真能用」")
-    g.add_argument("--core", metavar="PATH",
-                   help="客户端内核路径（默认自动探测 Clash Party / Mihomo Party / xray）")
-    g.add_argument("--auth-timeout", type=float, default=9.0,
-                   help="认证复核单节点超时秒（默认 9.0）")
-    g.add_argument("--auth-concurrency", type=int, default=4,
-                   help="认证复核并发（每个并发会起一个内核进程，默认 4）")
-    g.add_argument("--min-usable", type=int, default=0,
-                   help="凑够 N 个认证可用就提前结束复核（0 = 不限）")
-    g.add_argument("--auth-cache", metavar="FILE", default="auth_cache.json",
-                   help="认证结果缓存文件（默认 auth_cache.json，传空串关闭）")
-    g.add_argument("--auth-cache-ttl", type=int, default=6 * 3600,
-                   help="缓存有效期秒（默认 6 小时，0 = 永不过期）")
+    # ── 附录：自用分支（与借道无关） ──
+    g4 = p.add_argument_group(
+        "附录 · 自用节点（默认关闭，与「借道中转」无关）",
+        "这一组是为了「把节点当客户端登录」而做的：需要 REALITY 凭证可用。\n"
+        "对寻找可借道的中转没有任何帮助 —— 命中判据只看 TLS 层，不看能不能登录。",
+    )
+    g4.add_argument("--links", action="append", metavar="FILE",
+                    help="vless:// 分享链接文件（自带每节点 SNI 与凭证），可重复")
+    g4.add_argument("--verify-auth", action="store_true",
+                    help="对命中节点用本机内核跑 REALITY 握手，判定「凭证还能不能登录」")
+    g4.add_argument("--core", metavar="PATH",
+                    help="客户端内核路径（默认自动探测 Clash Party / Mihomo Party / xray）")
+    g4.add_argument("--auth-timeout", type=float, default=9.0,
+                    help="认证复核单节点超时秒（默认 9.0）")
+    g4.add_argument("--auth-concurrency", type=int, default=4,
+                    help="认证复核并发（每个并发起一个内核进程，默认 4）")
+    g4.add_argument("--min-usable", type=int, default=0,
+                    help="凑够 N 个认证可用就提前结束（0 = 不限）")
+    g4.add_argument("--auth-cache", metavar="FILE", default="auth_cache.json",
+                    help="认证结果缓存文件（默认 auth_cache.json，传空串关闭）")
+    g4.add_argument("--auth-cache-ttl", type=int, default=6 * 3600,
+                    help="缓存有效期秒（默认 6 小时，0 = 永不过期）")
     return p
 
 
