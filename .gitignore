@@ -18,3 +18,4 @@ output*.json
 output*.jsonl
 results*.json
 results*.jsonl
+auth_cache.json
