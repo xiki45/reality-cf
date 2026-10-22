@@ -272,11 +272,16 @@ async def verify_single(
     except Exception:
         _bump("probe_fail")
         return None
-    writer.close()
-    try:
-        await writer.wait_closed()
-    except Exception:
-        pass
+    # Step1 与 Step2 的 SNI 相同时（网段扫描的标准用法：--sni 就是 --cf-domain），
+    # 复用这条连接直接发 HTTP 请求，省掉一半握手。
+    reuse = target_sni.lower().rstrip(".") == my_cf_domain.lower().rstrip(".")
+
+    if not reuse:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
 
     if not der:
         _bump("no_cert")
@@ -293,11 +298,12 @@ async def verify_single(
         return None
 
     # ── Step 2: CF 反代特征 ──
-    try:
-        reader, writer, _, _ = await _tls_probe(ip, port, my_cf_domain, timeout)
-    except Exception:
-        _bump("step2_tls_fail")
-        return None
+    if not reuse:
+        try:
+            reader, writer, _, _ = await _tls_probe(ip, port, my_cf_domain, timeout)
+        except Exception:
+            _bump("step2_tls_fail")
+            return None
 
     try:
         writer.write(

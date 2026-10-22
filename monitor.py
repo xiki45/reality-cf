@@ -61,7 +61,7 @@ async def run_monitor(args, collect) -> int:
             reset_stats()
             reporter = Reporter(args.output, fmt=args.format)
             reporter.start()
-            seen: set[tuple[str, str, int]] = set()
+            seen: set[tuple[str, int]] = set()
 
             def on_miss(ip: str, port: int, names: list[str]) -> None:
                 # 只记「曾经是命中」的机器，否则状态库会被几万个无关 IP 撑爆
@@ -78,7 +78,7 @@ async def run_monitor(args, collect) -> int:
                 ):
                     if not result:
                         continue
-                    key = (result["ip"], result["port"], 0)
+                    key = (result["ip"], result["port"])
                     if key in seen:
                         continue
                     seen.add(key)

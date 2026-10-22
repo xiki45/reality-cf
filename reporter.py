@@ -88,8 +88,8 @@ class Reporter:
         if self._tmp is not None:
             os.replace(self._tmp, self.output_path)   # 原子替换
             self._tmp = None
-        usable = sum(1 for r in getattr(self, "_rows", []) if r.get("usable") is True)
-        if any(r.get("usable") is not None for r in getattr(self, "_rows", [])):
+        usable = getattr(self, "_usable", 0)
+        if getattr(self, "_authed", 0):
             logger.info("共发现 %d 个命中，其中认证可用 %d 个 → %s（%s）",
                         self.count, usable, self.output_path, self.fmt)
         else:
@@ -114,8 +114,10 @@ class Reporter:
 
     # ── 展示 ──
     def _print_row(self, r: dict) -> None:
-        self._rows = getattr(self, "_rows", [])
-        self._rows.append(r)
+        if r.get("usable") is True:
+            self._usable = getattr(self, "_usable", 0) + 1
+        if r.get("usable") is not None:
+            self._authed = getattr(self, "_authed", 0) + 1
         geo = r.get("geo") or {}
         loc = geo.get("country") or "??"
         if geo.get("city"):
