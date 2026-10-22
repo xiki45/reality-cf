@@ -13,12 +13,13 @@ SNI 配对」，这是本项目唯一正确的用法。
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import urllib.parse
 
 logger = logging.getLogger("reality-cf.targets")
 
-__all__ = ["parse_targets_file", "parse_links_file", "Target"]
+__all__ = ["parse_targets_file", "parse_links_file", "parse_ranges_file", "Target"]
 
 #: (host, port, sni)；sni 为空串表示「该行没给 SNI，需要用 --sni/--sni-list 补」
 Target = tuple[str, int, str]
@@ -129,3 +130,40 @@ def parse_links_file(path: str) -> list[dict]:
                 "fp": p.get("fp") or "chrome",
             })
     return nodes
+
+
+def parse_ranges_file(path: str, ports: list[int], max_hosts: int = 200_000) -> list[Target]:
+    """
+    读网段清单（每行 CIDR 或单个 IP），展开成 (ip, port, "") 目标。
+
+    这是「按机房扫」的入口：与其等订阅里冒出新节点，不如直接扫已知
+    代理友好型机房的 IP 段。配合一个已知落在 Cloudflare zone 内的 SNI
+    （`--sni`）即可判定「这台机器会不会把 TLS 透传给 CF」，不需要任何凭证。
+
+    超过 max_hosts 直接报错而不是悄悄截断 —— 误扫 /8 会打出事故。
+    """
+    nets: list[ipaddress._BaseNetwork] = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                nets.append(ipaddress.ip_network(line, strict=False))
+            except ValueError:
+                logger.warning("  %s:%d 不是合法网段，跳过: %s", path, lineno, line)
+
+    total = sum(n.num_addresses for n in nets) * max(1, len(ports))
+    if total > max_hosts:
+        raise ValueError(
+            f"展开后共 {total} 个目标，超过上限 {max_hosts}。"
+            f"请缩小网段、减少 --ports，或显式调大 --range-max"
+        )
+
+    out: list[Target] = []
+    for net in nets:
+        hosts = net.hosts() if net.num_addresses > 2 else [net.network_address]
+        for ip in hosts:
+            for port in ports:
+                out.append((str(ip), port, ""))
+    return out

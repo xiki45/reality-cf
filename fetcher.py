@@ -21,12 +21,13 @@ import logging
 import re
 from pathlib import Path
 
-from targets import parse_links_file  # noqa: F401  (对外暴露)
+from targets import parse_links_file, parse_ranges_file  # noqa: F401  (对外暴露)
 
 logger = logging.getLogger("reality-cf.fetcher")
 
 __all__ = [
-    "fetch_ct_logs", "fetch_tls_ledger", "parse_targets_file", "parse_links_file",
+    "fetch_ct_logs", "fetch_tls_ledger", "parse_targets_file",
+    "parse_links_file", "parse_ranges_file",
     "DEFAULT_PORTS",
 ]
 

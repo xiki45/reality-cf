@@ -24,10 +24,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 
 from fetcher import (
-    DEFAULT_PORTS, fetch_ct_logs, fetch_tls_ledger, parse_links_file, parse_targets_file,
+    DEFAULT_PORTS, fetch_ct_logs, fetch_tls_ledger, parse_links_file,
+    parse_ranges_file, parse_targets_file,
 )
 from reporter import Reporter, print_summary
 from verifier import get_stats, reset_stats, verify_batch
@@ -73,6 +75,17 @@ async def collect_targets(args, snis: list[str], ports: list[int]):
             targets.add(key)
             nodes.setdefault(key, n)
         logger.info("[Phase 0] 订阅链接 %s → %d 个 REALITY 节点（自带 SNI）", path, len(got))
+
+    # R: 网段清单（按机房扫：不需要凭证，也不需要订阅）
+    for path in getattr(args, "ranges", None) or []:
+        try:
+            got = parse_ranges_file(path, ports, max_hosts=getattr(args, "range_max", 200000))
+            logger.info("[Phase 0R] 网段清单 %s → %d 个 IP:PORT", path, len(got))
+            targets.update(got)
+        except FileNotFoundError:
+            logger.error("网段清单不存在: %s", path)
+        except Exception as exc:
+            logger.error("网段清单解析失败 %s: %s", path, exc)
 
     # C: 手工清单（最先加载，保证即使外网全挂也能跑）
     for path in args.targets or []:
@@ -203,9 +216,17 @@ async def run(args) -> int:
 
 
 async def _run_auth_stage(args, results: list[dict], nodes: dict):
-    """用本机真实内核逐条做 REALITY 认证复核，结果写回 result["usable"]/["auth_error"]。"""
+    """
+    用本机真实内核做 REALITY 认证复核。
+
+    三重省时（本轮实测 319 个命中里有 268 个凭证失效，全是重复劳动）：
+      1. 凭证指纹缓存（跨次运行）—— 同一套 uuid/pbk/sid 只实测一次
+      2. 同轮兄弟节点短路      —— 本轮已测过同凭证，直接复用结论
+      3. --min-usable 提前收工  —— 凑够目标数量就停，不扫完全部
+    """
     import asyncio as _aio
 
+    from authcache import AuthCache, fingerprint
     from authcheck import find_core, verify_node
 
     found = find_core(args.core)
@@ -220,27 +241,56 @@ async def _run_auth_stage(args, results: list[dict], nodes: dict):
         return None
 
     core, kind = found
-    counts = {"usable": 0, "auth_failed": 0, "not_reality": 0, "timeout": 0, "other": 0}
-    todo = []
+    counts = {"usable": 0, "auth_failed": 0, "not_reality": 0, "timeout": 0,
+              "other": 0, "cache": 0, "sibling": 0, "skipped": 0}
+    cache = AuthCache(getattr(args, "auth_cache", None) or None,
+                      ttl=int(getattr(args, "auth_cache_ttl", 6 * 3600) or 0))
+    min_usable = int(getattr(args, "min_usable", 0) or 0)
+    workers = max(1, int(getattr(args, "auth_concurrency", 4) or 1))
+
+    todo: list[tuple[dict, dict, str]] = []
+    seen_fp: dict[str, dict] = {}
     for r in results:
         key = (r["ip"], r["port"], str(r.get("target_sni", "")).lower())
         node = nodes.get(key)
         if not node:
-            # 目标来自 IP 清单/账本，没有 uuid/pbk，无法做认证
             r["usable"] = None
             r["auth_error"] = "no_credentials"
             counts["other"] += 1
             continue
-        todo.append((r, node))
+        fp = fingerprint(node)
+        r["_fp"] = fp
+        cached = cache.get(fp)
+        if cached:
+            r.update(usable=bool(cached.get("usable")),
+                     auth_error=cached.get("auth_error") or "",
+                     http_code="", core=os.path.basename(core), from_cache=True)
+            counts["usable" if cached.get("usable") else
+                   (cached.get("auth_error") if cached.get("auth_error") in counts else "other")] += 1
+            counts["cache"] += 1
+            continue
+        if fp in seen_fp:
+            prev = seen_fp[fp]
+            r.update(usable=prev["usable"], auth_error=prev["auth_error"],
+                     http_code=prev.get("http_code", ""), core=prev.get("core", ""),
+                     from_sibling=True)
+            counts["usable" if prev["usable"] else
+                   (prev["auth_error"] if prev["auth_error"] in counts else "other")] += 1
+            counts["sibling"] += 1
+            continue
+        todo.append((r, node, fp))
 
-    workers = max(1, int(getattr(args, "auth_concurrency", 4) or 1))
-    logger.info("认证复核内核: %s (%s) | %d 个节点 | 并发 %d", core, kind, len(todo), workers)
+    logger.info("认证复核内核: %s (%s) | 待测 %d 个（缓存命中 %d，同凭证跳过 %d）| 并发 %d",
+                core, kind, len(todo), counts["cache"], counts["sibling"], workers)
     lock = _aio.Lock()
 
-    async def one(r: dict, node: dict) -> None:
+    async def one(r: dict, node: dict, fp: str) -> bool:
         info = await _aio.to_thread(verify_node, core, kind, node, args.auth_timeout)
         r.update(info)
+        r["_fp"] = fp
         async with lock:
+            cache.put(fp, info)
+            seen_fp[fp] = info
             if info["usable"]:
                 counts["usable"] += 1
                 logger.info("  ✅ %s:%s 认证通过", r["ip"], r["port"])
@@ -248,8 +298,22 @@ async def _run_auth_stage(args, results: list[dict], nodes: dict):
                 err = info["auth_error"]
                 counts[err if err in counts else "other"] += 1
                 logger.info("  ❌ %s:%s %s", r["ip"], r["port"], err)
+            return min_usable > 0 and counts["usable"] >= min_usable
 
-    await _aio.gather(*(one(r, n) for r, n in todo))
+    # 分批跑，每批结束检查是否已凑够 --min-usable
+    for i in range(0, len(todo), workers):
+        chunk = todo[i:i + workers]
+        reached = await _aio.gather(*(one(r, n, fp) for r, n, fp in chunk))
+        if any(reached):
+            logger.info("已达 --min-usable %d，提前结束复核（跳过 %d 个）",
+                        min_usable, len(todo) - i - len(chunk))
+            for r, _n, _fp in todo[i + len(chunk):]:
+                r["usable"] = None
+                r["auth_error"] = "skipped_min_usable"
+                counts["skipped"] += 1
+            break
+
+    cache.save()
     return counts
 
 
@@ -388,6 +452,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="自备目标清单（一行 host / host:port / host:port:sni），可重复")
     p.add_argument("--links", action="append", metavar="FILE",
                    help="vless:// 分享链接文件（推荐：自带每节点 SNI 与 REALITY 凭证），可重复")
+    p.add_argument("--ranges", action="append", metavar="FILE",
+                   help="CIDR 网段清单（按机房扫，不需要凭证），可重复")
+    p.add_argument("--range-max", type=int, default=200000,
+                   help="网段展开后的目标数上限（默认 20 万，防误扫 /8）")
 
     p.add_argument("--ledger", help="TLS 账本目录")
     p.add_argument("--ledger-cache", default="./scans", help="账本缓存目录（默认 ./scans）")
@@ -416,6 +484,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="认证复核单节点超时秒（默认 9.0）")
     g.add_argument("--auth-concurrency", type=int, default=4,
                    help="认证复核并发（每个并发会起一个内核进程，默认 4）")
+    g.add_argument("--min-usable", type=int, default=0,
+                   help="凑够 N 个认证可用就提前结束复核（0 = 不限）")
+    g.add_argument("--auth-cache", metavar="FILE", default="auth_cache.json",
+                   help="认证结果缓存文件（默认 auth_cache.json，传空串关闭）")
+    g.add_argument("--auth-cache-ttl", type=int, default=6 * 3600,
+                   help="缓存有效期秒（默认 6 小时，0 = 永不过期）")
     return p
 
 

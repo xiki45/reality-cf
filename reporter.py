@@ -163,6 +163,11 @@ def print_summary(stats: dict) -> None:
             print(f"  复核超时        {auth['timeout']}")
         if auth.get("other"):
             print(f"  无法复核        {auth['other']}   ← 缺凭证或内核未找到")
+        saved = auth.get("cache", 0) + auth.get("sibling", 0)
+        if saved:
+            print(f"  省掉的复核      {saved}   ← 缓存 {auth.get('cache',0)} / 同凭证 {auth.get('sibling',0)}")
+        if auth.get("skipped"):
+            print(f"  提前跳过        {auth['skipped']}   ← 已达 --min-usable")
     if stats.get("dup_hit"):
         print(f"  重复命中(忽略)  {stats['dup_hit']}   ← --sni-list 笛卡尔积放大的部分")
     if stats.get("errors"):
