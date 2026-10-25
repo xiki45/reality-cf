@@ -259,11 +259,16 @@ python3 main.py --sni images.apple.com --auto-ledger --ledger-limit 1 --cf-domai
 
 ## 5. 自测
 
+在**仓库根目录**执行（`mock_server.py` 与 `certs/` 是同目录测试夹具，不要单独拷走）：
+
 ```bash
-python3 tests/t_unit.py    # 31 项：主机名匹配 / 证书匹配 / 头解析 / 账本端口推断 / 落盘
-python3 tests/t_e2e.py     # 21 项：六种 mock 节点场景 + 流式时序 + 统计计数
+bash tests/run_all.sh      # 一键跑下面三套，任一失败则退出码非 0
+python3 tests/t_unit.py    # 66 项：主机名匹配 / 证书匹配 / 头解析 / 账本端口推断 / 落盘
+python3 tests/t_e2e.py     # 23 项：六种 mock 节点场景 + 流式时序 + 统计计数
 python3 tests/t_cli.py     # 17 项：真实命令行全链路（含 --cf-domain / jsonl / 统计）
 ```
+
+`run_all.sh` 优先用 `.venv/bin/python`，回落 `python3`；也可用 `PY=/path/to/python` 指定。
 
 mock 服务覆盖六种节点行为：正确节点、蜜罐、普通 TLS、非 CF 后端、证书不符、黑洞。
 `cf_sni_filtered` 场景用服务端 `sni_callback` 模拟 SNI 白名单，是「应该命中」的正样本。
